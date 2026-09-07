@@ -1,0 +1,12 @@
+.env
+*.db
+*.db-shm
+*.db-wal
+service-account.json
+credentials.json
+token.json
+bot-output.log
+bot-error.log
+__pycache__/
+.pytest_cache/
+.venv/

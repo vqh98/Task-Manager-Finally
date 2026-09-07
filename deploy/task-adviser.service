@@ -1,0 +1,25 @@
+[Unit]
+Description=TaskAdviser Telegram Bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=taskadviser
+Group=taskadviser
+WorkingDirectory=/opt/task-adviser/app
+EnvironmentFile=/opt/task-adviser/data/.env
+ExecStart=/opt/task-adviser/venv/bin/python /opt/task-adviser/app/main.py
+Restart=always
+RestartSec=5
+TimeoutStopSec=20
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/task-adviser/data
+StandardOutput=append:/opt/task-adviser/data/bot.log
+StandardError=append:/opt/task-adviser/data/bot-error.log
+
+[Install]
+WantedBy=multi-user.target
