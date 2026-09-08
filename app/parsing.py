@@ -86,6 +86,11 @@ def enforce_explicit_calendar_date(
     has_jalali_date = bool(
         re.search(r"1[34]\d{2}[/-]\d{1,2}[/-]\d{1,2}", normalized)
         or re.search(rf"\d{{1,2}}\s*(?:ماه\s*)?(?:{'|'.join(map(re.escape, PERSIAN_MONTHS))})(?:ماه)?\s*1[34]\d{{2}}", normalized)
+        # A day and Persian month without a year is still an explicit
+        # calendar date.  AI date extraction must not be allowed to replace
+        # it with a guessed relative date (for example ۱۴ instead of ۱۶
+        # شهریور).  parse_datetime resolves the omitted year from ``now``.
+        or re.search(rf"\d{{1,2}}\s*(?:ماه\s*)?(?:{'|'.join(map(re.escape, PERSIAN_MONTHS))})(?:ماه)?(?!\s*1[34]\d{{2}})", normalized)
     )
     if not has_jalali_date:
         return meeting

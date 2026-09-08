@@ -44,6 +44,18 @@ class ParsingTests(unittest.TestCase):
         self.assertEqual((result.starts_at.hour, result.starts_at.minute), (16, 0))
         self.assertEqual((result.ends_at.hour, result.ends_at.minute), (20, 0))
 
+    def test_calendar_day_month_without_year_overrides_ai_guess(self):
+        now = datetime(2026, 9, 5, 13, 40, tzinfo=TZ)
+        ai_result = ParsedMeeting(
+            "جلسه", datetime(2026, 9, 5, 12, tzinfo=TZ),
+            datetime(2026, 9, 5, 13, tzinfo=TZ),
+        )
+        result = enforce_explicit_calendar_date(
+            ai_result, "جلسه جدید دوشنبه ۱۶ شهریور ماه ساعت ۱۲ تا ۱۳", TZ, now
+        )
+        self.assertEqual((result.starts_at.month, result.starts_at.day), (9, 7))
+        self.assertEqual((result.starts_at.hour, result.ends_at.hour), (12, 13))
+
     def test_explicit_jalali_meeting_dates_are_not_shifted(self):
         now = datetime(2026, 9, 5, 13, 40, tzinfo=TZ)
         for day, expected in ((11, 2), (12, 3), (13, 4)):
