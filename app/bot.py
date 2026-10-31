@@ -6,6 +6,7 @@ import logging
 import math
 import re
 import secrets
+import sys
 from datetime import date, datetime, time, timedelta, timezone
 
 import jdatetime
@@ -124,7 +125,7 @@ MAIN_MENU_NAVIGATION_TEXTS = {
     "➕ تسک جدید", "📋 لیست تسک‌ها", "📆 جلسات امروز", "📅 جلسات فردا",
     "🗓 مدیریت جلسات", "🔔 یادآورها", "📊 داشبورد", "🤖 فرمان مدیریتی",
     "🧑‍🤝‍🧑 چارت نیروها", "⚙️ تنظیمات", "👥 مدیریت دسترسی", "❓ راهنما",
-    "📌 تسک‌های واگذارشده به من",
+    "📌 تسک‌های واگذارشده به من", "🚀 مینی‌اپ",
 }
 
 
@@ -508,6 +509,14 @@ async def help_message(message: Message) -> None:
         "<b>مدیریت تسک</b>\nاز «تسک جدید» استفاده کنید. در لیست تسک‌ها می‌توانید درصد پیشرفت، آخرین توضیح و وضعیت انجام را تغییر دهید.\n\n<b>فرمان مدیریتی</b>\nاز دکمه «🤖 فرمان مدیریتی» استفاده کنید و درخواست را با زبان طبیعی بنویسید؛ مثل «تسک‌های کمتر از ۵۰ درصد پیشرفت را بفرست».\n\n"
         "برای لغو هر فرم: /cancel",
     )
+    if settings.platform_key == "telegram":
+        await message.answer(
+            "<b>ثبت تسک از چت دیگران</b>\n"
+            "در کادر چت بنویسید <code>@نام‌ربات متن تسک</code> و دکمه «تکمیل تسک در ربات» را بزنید؛ "
+            "پیامی در آن چت ارسال نمی‌شود. اینجا طرف مقابل را از چارت انتخاب کنید یا آیدی او را بفرستید. "
+            "فقط ددلاین و اولویت نامشخص پرسیده می‌شوند و پس از تکمیل، تسک ثبت می‌شود.\n"
+            "ربات به پیام‌های قبلی و هویت طرف مقابل چت دسترسی ندارد؛ متن را بعد از نام ربات کپی کنید.",
+        )
 
 
 ACCESS_USERS_PAGE_SIZE = 8
@@ -1431,6 +1440,11 @@ async def finalize_task(
         actor_id,
     )
     await state.clear()
+    await report_created_task(message, task_id, owner_id, actor_id)
+
+
+async def report_created_task(message: Message, task_id: int, owner_id: int, actor_id: int) -> None:
+    """Shared confirmation and assignment delivery for normal and inline tasks."""
     task = await db.task(task_id, owner_id)
     await message.answer(
         "✅ تسک ثبت شد.\n\n" + task_text(task, viewer_id=actor_id),
@@ -5417,6 +5431,9 @@ async def run() -> None:
     account_middleware = CanonicalAccountMiddleware(db, settings.platform_key)
     dp.message.outer_middleware(account_middleware)
     dp.callback_query.outer_middleware(account_middleware)
+    if settings.platform_key == "telegram":
+        from app.inline_tasks import InlineTaskFlow
+        dp.include_router(InlineTaskFlow(sys.modules[__name__]).router)
     dp.include_router(router)
     if settings.platform_key == "telegram" and settings.mini_app_url:
         try:

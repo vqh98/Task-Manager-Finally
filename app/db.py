@@ -3,6 +3,9 @@ from __future__ import annotations
 from contextlib import asynccontextmanager
 from datetime import date, datetime, time, timedelta, timezone
 from pathlib import Path
+import hashlib
+import secrets
+import time as unix_time
 
 import aiosqlite
 
@@ -55,6 +58,17 @@ class Database:
         async with self._connect() as db:
             await db.executescript("""
                 PRAGMA journal_mode=WAL;
+                CREATE TABLE IF NOT EXISTS inline_task_drafts (
+                    token TEXT PRIMARY KEY,
+                    owner_id INTEGER NOT NULL,
+                    source TEXT NOT NULL,
+                    query_hash TEXT NOT NULL,
+                    created_at INTEGER NOT NULL,
+                    expires_at INTEGER NOT NULL,
+                    task_id INTEGER
+                );
+                CREATE INDEX IF NOT EXISTS idx_inline_drafts_owner
+                    ON inline_task_drafts(owner_id, query_hash, expires_at);
                 CREATE TABLE IF NOT EXISTS tasks (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     user_id INTEGER NOT NULL,
@@ -1308,6 +1322,87 @@ class Database:
             )
             await db.commit()
             return task_id
+
+    async def create_inline_task_draft(self, owner_id: int, source: str) -> str:
+        source = source.strip()
+        if not source or len(source) > 512:
+            raise ValueError("inline task text must contain 1 to 512 characters")
+        now = int(unix_time.time())
+        digest = hashlib.sha256(source.encode()).hexdigest()
+        async with self._connect() as db:
+            await db.execute("BEGIN IMMEDIATE")
+            await db.execute("DELETE FROM inline_task_drafts WHERE expires_at<=?", (now,))
+            row = await (await db.execute(
+                "SELECT token FROM inline_task_drafts WHERE owner_id=? AND query_hash=? "
+                "AND task_id IS NULL ORDER BY created_at DESC LIMIT 1", (owner_id, digest),
+            )).fetchone()
+            if row:
+                await db.commit()
+                return row[0]
+            token = secrets.token_urlsafe(18)
+            await db.execute(
+                "INSERT INTO inline_task_drafts VALUES(?,?,?,?,?,?,NULL)",
+                (token, owner_id, source, digest, now, now + 86400),
+            )
+            # Bound per-user storage even while Telegram sends a query per keystroke.
+            await db.execute(
+                "DELETE FROM inline_task_drafts WHERE owner_id=? AND task_id IS NULL AND token NOT IN "
+                "(SELECT token FROM inline_task_drafts WHERE owner_id=? AND task_id IS NULL "
+                "ORDER BY created_at DESC,rowid DESC LIMIT 50)", (owner_id, owner_id),
+            )
+            await db.commit()
+            return token
+
+    async def inline_task_draft(self, token: str, owner_id: int) -> dict | None:
+        async with self._connect() as db:
+            row = await (await db.execute(
+                "SELECT source,task_id FROM inline_task_drafts "
+                "WHERE token=? AND owner_id=? AND expires_at>?",
+                (token, owner_id, int(unix_time.time())),
+            )).fetchone()
+        return {"source": row[0], "task_id": row[1]} if row else None
+
+    async def finalize_inline_task(
+        self, token: str, owner_id: int, title: str, deadline: datetime,
+        priority: int, assignee_id: int,
+    ) -> tuple[int, bool]:
+        """Create a task and consume its draft atomically; retries return the same id."""
+        if not title.strip() or int(priority) not in (1, 2, 3, 4):
+            raise ValueError("invalid task fields")
+        now = int(unix_time.time())
+        created_at = datetime.now(deadline.tzinfo).isoformat()
+        async with self._connect() as db:
+            await db.execute("BEGIN IMMEDIATE")
+            draft = await (await db.execute(
+                "SELECT source,task_id FROM inline_task_drafts "
+                "WHERE token=? AND owner_id=? AND expires_at>?", (token, owner_id, now),
+            )).fetchone()
+            if not draft:
+                raise ValueError("draft_expired")
+            if draft[1] is not None:
+                await db.commit()
+                return int(draft[1]), False
+            member = await (await db.execute(
+                "SELECT display_name FROM team_members WHERE manager_id=? AND member_id=? AND active=1",
+                (owner_id, assignee_id),
+            )).fetchone()
+            if not member:
+                raise ValueError("member_unavailable")
+            cursor = await db.execute(
+                """INSERT INTO tasks(user_id,title,deadline,priority,assignee,last_note,status,
+                   created_at,updated_at,assignee_user_id,last_changed_by)
+                   VALUES(?,?,?,?,?,?,'open',?,?,?,?)""",
+                (owner_id, title.strip()[:200], deadline.isoformat(), priority,
+                 (member[0] or str(assignee_id))[:200], draft[0], created_at, created_at, assignee_id, owner_id),
+            )
+            task_id = int(cursor.lastrowid)
+            await db.execute(
+                "INSERT INTO task_progress_history(task_id,manager_id,changed_by,progress,changed_at) "
+                "VALUES(?,?,?,0,?)", (task_id, owner_id, owner_id, created_at),
+            )
+            await db.execute("UPDATE inline_task_drafts SET task_id=? WHERE token=?", (task_id, token))
+            await db.commit()
+            return task_id, True
 
     async def create_recurrence_series(self, user_id, title, anchor, interval, assignee,
                                        note="", priority=1, weekdays=None, frequency="daily",
