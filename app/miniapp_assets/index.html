@@ -1,0 +1,33 @@
+<!doctype html>
+<html lang="fa" dir="rtl">
+<head>
+  <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+  <meta name="theme-color" content="#111827"><title>TaskAdviser</title>
+  <script async src="https://tapi.bale.ai/miniapp.js"></script>
+  <script async src="https://telegram.org/js/telegram-web-app.js"></script>
+  <link rel="stylesheet" href="/miniapp/assets/styles.css">
+</head>
+<body>
+  <div class="ambient one"></div><div class="ambient two"></div>
+  <main>
+    <header><div><span class="eyebrow">TASKADVISER</span><h1>مرکز فرمان روزانه</h1><p id="greeting">همه‌چیز برای یک روز متمرکز</p></div><div class="avatar">✓</div></header>
+    <section id="dashboard" class="page active">
+      <div class="hero"><div><small>پیشرفت کلی</small><strong id="completion">۰٪</strong><p id="heroText">در حال دریافت اطلاعات…</p></div><div class="ring" id="ring"><span>✓</span></div></div>
+      <div class="stats">
+        <article><span class="icon blue">◫</span><b id="openCount">۰</b><small>تسک باز</small></article>
+        <article><span class="icon red">!</span><b id="overdueCount">۰</b><small>عقب‌افتاده</small></article>
+        <article><span class="icon violet">◷</span><b id="meetingCount">۰</b><small>جلسه امروز</small></article>
+        <article><span class="icon amber">♢</span><b id="reminderCount">۰</b><small>یادآور هفته</small></article>
+      </div>
+      <div class="section-title"><h2>نیازمند توجه</h2><button data-go="tasks">مشاهده همه</button></div><div id="attention" class="stack skeleton"></div>
+      <div class="section-title"><h2>جلسات امروز</h2><button data-go="meetings">تقویم</button></div><div id="todayMeetings" class="timeline skeleton"></div>
+      <div class="sync" id="syncState"><span>G</span><div><b>Google Calendar</b><small>بررسی وضعیت اتصال…</small></div><i></i></div>
+    </section>
+    <section id="tasks" class="page"><div class="page-head"><div><small>کارها</small><h2>تسک‌ها</h2></div><button class="add" data-modal="task">＋</button></div><div class="chips"><button class="selected" data-scope="open">باز</button><button data-scope="done">انجام‌شده</button><button data-scope="all">همه</button></div><div id="taskList" class="stack"></div></section>
+    <section id="meetings" class="page"><div class="page-head"><div><small>برنامه</small><h2>جلسات آینده</h2></div><button class="add" data-modal="meeting">＋</button></div><div id="meetingList" class="timeline"></div></section>
+    <section id="reminders" class="page"><div class="page-head"><div><small>پیگیری</small><h2>یادآورها</h2></div><button class="add" data-modal="reminder">＋</button></div><div id="reminderList" class="stack"></div></section>
+  </main>
+  <nav><button class="active" data-page="dashboard"><span>⌂</span>خانه</button><button data-page="tasks"><span>✓</span>تسک‌ها</button><button data-page="meetings"><span>▦</span>جلسات</button><button data-page="reminders"><span>♢</span>یادآورها</button></nav>
+  <dialog id="editor"><form method="dialog" id="editorForm"><div class="grab"></div><div class="modal-title"><h3 id="modalTitle">ثبت جدید</h3><button value="cancel">×</button></div><div id="formFields"></div><button class="primary" id="saveButton" value="default">ثبت و ذخیره</button></form></dialog>
+  <div id="toast"></div><script src="/miniapp/assets/app.js?v=20261025"></script>
+</body></html>

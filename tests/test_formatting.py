@@ -6,6 +6,7 @@ import app.bot as bot_module
 from app.charts import progress_chart
 from app.config import Settings
 from app.models import Priority, Task
+from app.output_formatting import RTL_MARK, localize_visible_digits, rtl_line
 
 
 class FormattingTests(unittest.TestCase):
@@ -23,6 +24,17 @@ class FormattingTests(unittest.TestCase):
         value = datetime(2026, 10, 5, 10, 30, tzinfo=ZoneInfo("Asia/Tehran"))
         self.assertEqual(bot_module.fmt_date(value), "۱۳ مهر ۱۴۰۵")
         self.assertEqual(bot_module.fmt_dt(value), "۱۳ مهر ۱۴۰۵، ساعت ۱۰:۳۰")
+
+    def test_visible_digits_are_localized_without_corrupting_links(self):
+        source = 'جلسه #981 ساعت 10 <a href="https://example.com/a12">لینک 2</a>'
+        self.assertEqual(
+            localize_visible_digits(source),
+            'جلسه #۹۸۱ ساعت ۱۰ <a href="https://example.com/a12">لینک ۲</a>',
+        )
+
+    def test_rtl_line_marks_english_meeting_titles(self):
+        self.assertEqual(rtl_line("3. MBA"), RTL_MARK + "3. MBA")
+        self.assertEqual(rtl_line(RTL_MARK + "MBA"), RTL_MARK + "MBA")
 
     def test_progress_chart_accepts_legacy_naive_dates(self):
         now = datetime(2026, 8, 13, 20, 0, tzinfo=ZoneInfo("Asia/Tehran"))

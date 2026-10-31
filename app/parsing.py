@@ -5,7 +5,6 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
-import dateparser
 import jdatetime
 
 
@@ -48,6 +47,63 @@ class ParsedMeeting:
     ends_at: datetime
 
 
+def extract_meeting_time_ranges(text: str) -> list[tuple[int, int, int, int]]:
+    """Extract every explicit same-day time range in a Persian meeting text."""
+    clean = normalize_digits(text or "")
+    matches = re.finditer(
+        r"(?:از\s*)?(?:ساعت\s*)?(\d{1,2})(?::(\d{2}))?\s*"
+        r"(?:الی|تا|[-–])\s*(?:ساعت\s*)?(\d{1,2})(?::(\d{2}))?",
+        clean,
+    )
+    ranges: list[tuple[int, int, int, int]] = []
+    for match in matches:
+        start_hour, start_minute = int(match.group(1)), int(match.group(2) or 0)
+        end_hour, end_minute = int(match.group(3)), int(match.group(4) or 0)
+        if start_hour <= 23 and end_hour <= 23 and start_minute <= 59 and end_minute <= 59:
+            ranges.append((start_hour, start_minute, end_hour, end_minute))
+    return ranges
+
+
+def extract_explicit_meeting_time(text: str) -> tuple[int, int] | None:
+    """Extract a user-written start time without treating bare dates as time."""
+    clean = re.sub(r"[\u200c\u200d\u00a0]+", " ", normalize_digits(text or ""))
+    period = r"صبح|بامداد|ظهر|بعد\s*از\s*ظهر|بعدازظهر|عصر|شب"
+    match = re.search(
+        rf"(?:ساعت\s*)?(\d{{1,2}})(?::(\d{{2}}))?\s*({period})\b",
+        clean,
+    )
+    period_value = match.group(3) if match else None
+    if not match:
+        match = re.search(
+            rf"\b({period})\s*(?:ساعت\s*)?(\d{{1,2}})(?::(\d{{2}}))?",
+            clean,
+        )
+        if match:
+            period_value = match.group(1)
+            hour, minute = int(match.group(2)), int(match.group(3) or 0)
+        else:
+            hour = minute = -1
+    else:
+        hour, minute = int(match.group(1)), int(match.group(2) or 0)
+    if match and 0 <= hour <= 23 and 0 <= minute <= 59:
+        if period_value in {"عصر", "شب", "ظهر", "بعدازظهر"} or (
+            period_value and re.fullmatch(r"بعد\s*از\s*ظهر", period_value)
+        ):
+            if hour < 12:
+                hour += 12
+        elif period_value in {"صبح", "بامداد"} and hour == 12:
+            hour = 0
+        return hour, minute
+
+    match = re.search(r"(?:از\s*)?ساعت\s*(\d{1,2})(?::(\d{2}))?", clean)
+    if not match:
+        match = re.search(r"(?<!\d)(\d{1,2}):(\d{2})(?!\d)", clean)
+    if not match:
+        return None
+    hour, minute = int(match.group(1)), int(match.group(2) or 0)
+    return (hour, minute) if 0 <= hour <= 23 and 0 <= minute <= 59 else None
+
+
 def explicit_relative_day(text: str) -> int | None:
     """Return the explicit relative-day offset, if the text contains one."""
     normalized = re.sub(r"[\u200c\u200d]+", " ", normalize_digits(text or ""))
@@ -58,6 +114,20 @@ def explicit_relative_day(text: str) -> int | None:
     if re.search(r"\bامروز\b", normalized):
         return 0
     return None
+
+
+def has_explicit_jalali_date(text: str) -> bool:
+    """Return whether text contains an explicit Jalali calendar date."""
+    normalized = normalize_digits(text or "")
+    normalized = re.sub(r"[\u200c\u200d\u00a0]+", " ", normalized)
+    months = "|".join(map(re.escape, PERSIAN_MONTHS))
+    return bool(
+        re.search(r"1[34]\d{2}[/-]\d{1,2}[/-]\d{1,2}", normalized)
+        or re.search(
+            rf"\d{{1,2}}\s*(?:ماه\s*)?(?:{months})(?:ماه)?(?:\s*1[34]\d{{2}})?",
+            normalized,
+        )
+    )
 
 
 def enforce_explicit_relative_day(
@@ -75,6 +145,47 @@ def enforce_explicit_relative_day(
     return ParsedMeeting(meeting.title, starts_at, ends_at)
 
 
+def enforce_explicit_named_weekday(
+    meeting: ParsedMeeting, source_text: str, timezone: ZoneInfo, now: datetime
+) -> ParsedMeeting:
+    """Correct an AI date when the text names exactly one Persian weekday.
+
+    The model is still used for the subject and time, but weekday arithmetic is
+    deterministic. Multiple weekdays are left alone because they usually
+    describe a recurrence rule rather than one occurrence.
+    """
+    # Relative-day phrases are an even stronger explicit signal. If a user
+    # writes «فردا چهارشنبه», keep the exact relative day instead of letting
+    # a possibly inconsistent weekday override it.
+    if explicit_relative_day(source_text) is not None:
+        return meeting
+    # A written calendar date is stronger than its accompanying weekday.
+    # This is especially important when the date is today: the bare-weekday
+    # rule intentionally points to next week, while «یکشنبه ۱۲ مهر» does not.
+    if has_explicit_jalali_date(source_text):
+        return meeting
+    matches: list[int] = []
+    remaining = source_text or ""
+    for name, weekday in sorted(WEEKDAY_NUMBERS.items(), key=lambda item: len(item[0]), reverse=True):
+        if name in remaining:
+            matches.append(weekday)
+            remaining = remaining.replace(name, " ")
+    weekdays = set(matches)
+    if len(weekdays) != 1:
+        return meeting
+    target = _next_named_weekday(source_text, now)
+    if target is None:
+        return meeting
+    target_date = target.astimezone(timezone).date()
+    starts_at = meeting.starts_at.astimezone(timezone).replace(
+        year=target_date.year, month=target_date.month, day=target_date.day
+    )
+    duration = meeting.ends_at - meeting.starts_at
+    if duration <= timedelta(0) or duration > timedelta(hours=24):
+        duration = timedelta(hours=1)
+    return ParsedMeeting(meeting.title, starts_at, starts_at + duration)
+
+
 def enforce_explicit_calendar_date(
     meeting: ParsedMeeting, source_text: str, timezone: ZoneInfo, now: datetime
 ) -> ParsedMeeting:
@@ -83,16 +194,7 @@ def enforce_explicit_calendar_date(
     # Normalize whitespace as forwarded Telegram messages may contain newlines,
     # non-breaking spaces, or a ZWNJ around «شهریورماه».
     normalized = re.sub(r"[\u200c\u200d\u00a0]+", " ", normalized)
-    has_jalali_date = bool(
-        re.search(r"1[34]\d{2}[/-]\d{1,2}[/-]\d{1,2}", normalized)
-        or re.search(rf"\d{{1,2}}\s*(?:ماه\s*)?(?:{'|'.join(map(re.escape, PERSIAN_MONTHS))})(?:ماه)?\s*1[34]\d{{2}}", normalized)
-        # A day and Persian month without a year is still an explicit
-        # calendar date.  AI date extraction must not be allowed to replace
-        # it with a guessed relative date (for example ۱۴ instead of ۱۶
-        # شهریور).  parse_datetime resolves the omitted year from ``now``.
-        or re.search(rf"\d{{1,2}}\s*(?:ماه\s*)?(?:{'|'.join(map(re.escape, PERSIAN_MONTHS))})(?:ماه)?(?!\s*1[34]\d{{2}})", normalized)
-    )
-    if not has_jalali_date:
+    if not has_explicit_jalali_date(normalized):
         return meeting
     deterministic = parse_datetime(normalized, timezone, now)
     if not deterministic:
@@ -104,7 +206,13 @@ def enforce_explicit_calendar_date(
 
 
 def normalize_digits(text: str) -> str:
-    return text.translate(PERSIAN_DIGITS).translate(str.maketrans("۰۱۲۳۴۵۶۷۸۹", "0123456789"))
+    text = text.translate(PERSIAN_DIGITS).translate(str.maketrans("۰۱۲۳۴۵۶۷۸۹", "0123456789"))
+    text = text.replace("ي", "ی").replace("ك", "ک")
+    text = re.sub(r"[\u200e\u200f\u202a-\u202e\u2066-\u2069]", "", text)
+    text = re.sub(r"[\u00a0\u202f]", " ", text)
+    # Common keyboard spellings of Jalali months must work in every parser,
+    # including the explicit-date guard before weekday interpretation.
+    return re.sub(r"(?<![\w])ا(بان|ذر)(?=$|[\s\u200c،,؛:]|ماه)", r"آ\1", text)
 
 
 def _fa_hour(value: int) -> str:
@@ -138,8 +246,75 @@ def format_meeting_summary(base_title: str, starts_at: datetime, ends_at: dateti
     return " ".join(part for part in parts if part)[:200]
 
 
+def extract_explicit_meeting_topic(text: str) -> str | None:
+    """Return a topic explicitly labelled by the sender, before any AI guess."""
+    clean = normalize_digits(text)
+    match = re.search(
+        r"(?im)^\s*[🔹▪▫•\-]*\s*موضوع(?:\s+(?:جلسه|نشست|رویداد|ایونت))?\s*[:：\-]\s*(.+?)\s*$",
+        clean,
+    )
+    if not match:
+        return None
+    topic = match.group(1).strip(" 🟢🔴🟡⚪️🔹▪▫•-،؛:：.|")
+    return topic[:100] if len(topic) >= 2 else None
+
+
+def extract_explicit_meeting_counterpart(text: str) -> str | None:
+    """Extract a directly stated «جلسه با ...» counterpart from its own line."""
+    clean = normalize_digits(text)
+    visit = re.search(
+        r"(?im)^\s*(?:برنامه\s+)?دیدار\s+با\s+([^\n]+)", clean,
+    )
+    if visit:
+        counterpart = visit.group(1).strip(" * _🟢🔴🟡⚪️🔹▪▫•-،؛:：.|")
+        if len(counterpart) >= 2 and not is_meeting_title_boilerplate(counterpart):
+            return f"دیدار با {counterpart}"[:100]
+    match = re.search(
+        r"(?im)^\s*[🔹▪▫•\-]*\s*جلسه\s+با\s+(.+?)\s*$",
+        clean,
+    )
+    if not match:
+        return None
+    counterpart = match.group(1).strip(" 🟢🔴🟡⚪️🔹▪▫•-،؛:：.|")
+    if len(counterpart) < 2 or counterpart.startswith(("موضوع", "محور")):
+        return None
+    return f"با {counterpart}"[:100]
+
+
+def is_meeting_title_boilerplate(value: str) -> bool:
+    """Reject attendance requests and announcement prose as meeting titles."""
+    normalized = normalize_digits(value).strip().lower()
+    return any(
+        phrase in normalized
+        for phrase in (
+            "حضور داشته باشید", "حضور بهم رسانید", "حضور به هم رسانید",
+            "تشریف بیاورید", "تشریف داشته باشید", "شرکت کنید",
+            "لطفا حضور", "لطفاً حضور", "راس ساعت", "رأس ساعت",
+            "به موقع حضور", "فراموش نکنید",
+            "لغو خواهد شد", "لغو می‌شود", "لغو می شود",
+            "در غیر این صورت", "هماهنگی برگزار", "در صورتی که",
+        )
+    )
+
+
 def summarize_meeting_title(text: str) -> str:
     clean = normalize_digits(text)
+    explicit_topic = extract_explicit_meeting_topic(clean)
+    if explicit_topic:
+        return explicit_topic
+    explicit_counterpart = extract_explicit_meeting_counterpart(clean)
+    if explicit_counterpart:
+        return explicit_counterpart
+    # Telegram/Persian text may use a ZWNJ inside relative-day phrases such
+    # as «پس‌فردا». Keep ZWNJ in actual subject words, but normalize it for
+    # the temporal phrases that are removed from the title.
+    relative_day_patterns = (
+        (r"پس[\s\u200c\u200d]*فردا", "پس فردا"),
+        (r"این[\s\u200c\u200d]*هفته", "این هفته"),
+        (r"هفته[\s\u200c\u200d]*(?:بعد|آینده)", lambda match: match.group(0).replace("\u200c", " ").replace("\u200d", " ")),
+    )
+    for pattern, replacement in relative_day_patterns:
+        clean = re.sub(pattern, replacement, clean)
     if "موکب" in clean and any(word in clean for word in ("خدمت", "پذیرایی", "زائر")):
         return "خدمت‌رسانی در موکب"
     ignored = (
@@ -166,10 +341,14 @@ def summarize_meeting_title(text: str) -> str:
         line = raw_line.strip(" 🟢🔴🟡⚪️-:،")
         if not line or any(line.startswith(prefix) for prefix in ignored):
             continue
-        # A line that starts with a relative date is a schedule line, not a
-        # subject (the subject, when present, is normally on another line).
-        if re.match(r"^(?:امروز|فردا|پس\s*فردا|این هفته|هفته\s*(?:بعد|آینده))\b", line) and re.search(r"\d", line):
-            continue
+        # A relative date can share its line with the subject, for example
+        # «امروز ساعت ۱۱ جلسه با آقای ملایی». Remove the date prefix and let
+        # the normal temporal cleanup retain the subject that follows it.
+        line = re.sub(
+            r"^(?:امروز|فردا|پس\s*فردا|این هفته|هفته\s*(?:بعد|آینده))\b\s*",
+            "",
+            line,
+        )
         line = without_temporal_metadata(line)
         if line:
             candidates.append(line)
@@ -198,6 +377,8 @@ def summarize_meeting_title(text: str) -> str:
         score = 0
         if any(word in lowered for word in ("افتتاحیه", "جلسه", "نشست", "همایش", "رویداد", "دیدار", "برنامه")):
             score += 20
+        if is_meeting_title_boilerplate(value):
+            score -= 50
         if value.lstrip().startswith("#") or any(word in lowered for word in ("روابط‌عمومی", "اطلاع‌رسانی")):
             score -= 20
         return score, min(len(value), 100)
@@ -222,20 +403,18 @@ def parse_datetime(text: str, timezone: ZoneInfo, now: datetime | None = None) -
         return (now + timedelta(days=1)).replace(hour=hour, minute=minute, second=0, microsecond=0)
     if re.search(r"\bامروز\b", relative_text):
         return now.replace(hour=hour, minute=minute, second=0, microsecond=0)
-    named_weekday = _next_named_weekday(text, now)
-    if named_weekday:
-        return named_weekday.replace(hour=hour, minute=minute, second=0, microsecond=0)
     named_months = "|".join(PERSIAN_MONTHS)
     # Persian announcements commonly write «۳ شهریورماه ۱۴۰۵».
     named_date_text = text.replace("ماه", " ")
-    named_jalali = re.search(rf"(\d{{1,2}})\s+({named_months})\s+(1[34]\d{{2}})", named_date_text)
-    if not named_jalali:
-        attached = re.search(rf"(\d{{1,2}})\s+({named_months})ماه\s+(1[34]\d{{2}})", text)
-        named_jalali = attached
+    named_jalali = re.search(
+        rf"(\d{{1,2}})\s+({named_months})(?:\s+(1[34]\d{{2}}))?",
+        named_date_text,
+    )
     if named_jalali:
         day = int(named_jalali.group(1))
         month = PERSIAN_MONTHS[named_jalali.group(2)]
-        year = int(named_jalali.group(3))
+        current_jalali = jdatetime.datetime.fromgregorian(datetime=now)
+        year = int(named_jalali.group(3) or current_jalali.year)
         gregorian = jdatetime.datetime(year, month, day, hour, minute).togregorian()
         return gregorian.replace(tzinfo=timezone)
     # تاریخ شمسی صریح مانند 1405/05/24 ساعت 10:30
@@ -244,6 +423,14 @@ def parse_datetime(text: str, timezone: ZoneInfo, now: datetime | None = None) -
         year, month, day = map(int, jalali.group(1, 2, 3))
         gregorian = jdatetime.datetime(year, month, day, hour, minute).togregorian()
         return gregorian.replace(tzinfo=timezone)
+    named_weekday = _next_named_weekday(text, now)
+    if named_weekday:
+        return named_weekday.replace(hour=hour, minute=minute, second=0, microsecond=0)
+    # dateparser has a noticeable import-time memory cost. Most meeting
+    # messages are handled by the deterministic Persian rules above, so only
+    # load the generic fallback when a message actually needs it.
+    import dateparser
+
     parsed = dateparser.parse(
         text,
         languages=["fa", "en"],
@@ -346,12 +533,9 @@ def parse_forwarded_meeting(text: str, timezone: ZoneInfo, now: datetime | None 
     if duration_match:
         value = int(duration_match.group(1))
         duration = value * 60 if duration_match.group(2) in {"ساعت", "hour"} else value
-    range_match = re.search(
-        r"(?:از\s*)?(?:ساعت\s*)?(\d{1,2})(?::(\d{2}))?\s*(?:الی|تا|[-–])\s*(?:ساعت\s*)?(\d{1,2})(?::(\d{2}))?",
-        clean,
-    )
-    if range_match:
-        h1, m1, h2, m2 = int(range_match.group(1)), int(range_match.group(2) or 0), int(range_match.group(3)), int(range_match.group(4) or 0)
+    time_ranges = extract_meeting_time_ranges(clean)
+    if time_ranges:
+        h1, m1, h2, m2 = time_ranges[0]
         starts_at = starts_at.replace(hour=h1, minute=m1, second=0, microsecond=0)
         ends_at = starts_at.replace(hour=h2, minute=m2)
         if ends_at <= starts_at:

@@ -6,6 +6,12 @@ import re
 
 import jdatetime
 
+WEEKDAY_NAMES = {"شنبه": 5, "یکشنبه": 6, "یک شنبه": 6, "دوشنبه": 0, "دو شنبه": 0,
+                 "سه شنبه": 1, "چهارشنبه": 2, "چهار شنبه": 2,
+                 "پنجشنبه": 3, "پنج شنبه": 3, "جمعه": 4}
+PERSIAN_NUMBERS = {"یک": 1, "دو": 2, "سه": 3, "چهار": 4, "پنج": 5, "شش": 6,
+                   "هفت": 7, "هشت": 8, "نه": 9, "ده": 10, "یازده": 11, "دوازده": 12}
+
 
 @dataclass(slots=True, frozen=True)
 class RecurrenceRule:
@@ -82,6 +88,77 @@ def occurrences_until(anchor: datetime, last: datetime, rule: RecurrenceRule,
         result.append(following)
         cursor = following
     return result
+
+
+def parse_temporary_weekday_override(text: str, now: datetime) -> list[dict] | None:
+    """Split one temporary weekday time override into ordinary weekly series."""
+    from app.parsing import extract_meeting_time_ranges, normalize_digits
+    clean = re.sub(r"[\u200c\u200d]+", " ", normalize_digits(text or ""))
+    ranges = extract_meeting_time_ranges(clean)
+    if len(ranges) != 2:
+        return None
+    found: list[tuple[int, int, int]] = []
+    for name, weekday in sorted(WEEKDAY_NAMES.items(), key=lambda item: len(item[0]), reverse=True):
+        for match in re.finditer(re.escape(name), clean):
+            if not any(start <= match.start() < end for start, end, _ in found):
+                found.append((match.start(), match.end(), weekday))
+    weekdays = sorted({weekday for _, _, weekday in found})
+    if len(weekdays) < 2:
+        return None
+    override_match = re.search(
+        r"(?:تایم|زمان|ساعت)\s*(?:روز\s*)?(?P<day>شنبه|یک\s*شنبه|دو\s*شنبه|سه\s*شنبه|چهار\s*شنبه|پنج\s*شنبه|جمعه)(?:\s*(?:اش|ش))?",
+        clean,
+    ) or re.search(
+        r"(?P<day>شنبه|یک\s*شنبه|دو\s*شنبه|سه\s*شنبه|چهار\s*شنبه|پنج\s*شنبه|جمعه)(?:\s*(?:اش|ش))?.{0,24}?(?:می\s*شود|میشه|تغییر)",
+        clean,
+    )
+    if not override_match:
+        return None
+    normalized_names = {re.sub(r"\s+", "", key): value for key, value in WEEKDAY_NAMES.items()}
+    override_weekday = normalized_names.get(re.sub(r"\s+", "", override_match.group("day")))
+    if override_weekday not in weekdays:
+        return None
+    weeks_match = re.search(
+        r"(?:تا|برای)\s*(\d+|یک|دو|سه|چهار|پنج|شش|هفت|هشت|نه|ده|یازده|دوازده)\s*هفته", clean
+    )
+    if not weeks_match:
+        return None
+    token = weeks_match.group(1)
+    weeks = int(token) if token.isdigit() else PERSIAN_NUMBERS[token]
+    if not 1 <= weeks <= 52:
+        return None
+
+    def next_day(weekday: int, hour: int, minute: int) -> datetime:
+        candidate = (now + timedelta(days=(weekday - now.weekday()) % 7)).replace(
+            hour=hour, minute=minute, second=0, microsecond=0)
+        return candidate + timedelta(days=7) if candidate <= now else candidate
+
+    def end_for(start: datetime, hour: int, minute: int) -> datetime:
+        end = start.replace(hour=hour, minute=minute)
+        return end + timedelta(days=1) if end <= start else end
+
+    base_h1, base_m1, base_h2, base_m2 = ranges[0]
+    new_h1, new_m1, new_h2, new_m2 = ranges[1]
+    parts: list[dict] = []
+    other_weekdays = [day for day in weekdays if day != override_weekday]
+    if other_weekdays:
+        anchor = min(next_day(day, base_h1, base_m1) for day in other_weekdays)
+        parts.append({"starts_at": anchor.isoformat(), "ends_at": end_for(anchor, base_h2, base_m2).isoformat(),
+                      "recurrence": {"frequency": "weekly", "interval": 1, "weekdays": other_weekdays,
+                                     "jalali_day": None, "ends_on": None}, "kind": "unchanged"})
+    temporary_start = next_day(override_weekday, new_h1, new_m1)
+    temporary_end_date = (temporary_start + timedelta(weeks=weeks - 1)).date()
+    parts.append({"starts_at": temporary_start.isoformat(),
+                  "ends_at": end_for(temporary_start, new_h2, new_m2).isoformat(),
+                  "recurrence": {"frequency": "weekly", "interval": 1, "weekdays": [override_weekday],
+                                 "jalali_day": None, "ends_on": temporary_end_date.isoformat()},
+                  "kind": "temporary", "occurrences": weeks})
+    resumed_start = (temporary_start + timedelta(weeks=weeks)).replace(hour=base_h1, minute=base_m1)
+    parts.append({"starts_at": resumed_start.isoformat(),
+                  "ends_at": end_for(resumed_start, base_h2, base_m2).isoformat(),
+                  "recurrence": {"frequency": "weekly", "interval": 1, "weekdays": [override_weekday],
+                                 "jalali_day": None, "ends_on": None}, "kind": "resumed"})
+    return parts
 
 
 def parse_recurrence_text(text: str, anchor: datetime, timezone) -> dict:

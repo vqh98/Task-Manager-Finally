@@ -7,6 +7,7 @@
 - `/opt/task-adviser/app`: کد برنامه؛ قابل جایگزینی هنگام آپدیت
 - `/opt/task-adviser/data`: دیتابیس، توکن‌ها، تنظیمات و گزارش‌ها؛ پایدار و محرمانه
 - `/opt/task-adviser/venv`: محیط پایتون
+- لاگ برنامه: مقدار `LOG_PATH` در `.env`؛ به‌صورت پیش‌فرض `taskmanager.log` در مسیر داده
 
 فایل‌های محرمانه‌ای که باید در `/opt/task-adviser/data` قرار بگیرند:
 

@@ -1,0 +1,15 @@
+{
+  "name": "taskadviser-telegram-serverless",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Telegram Serverless migration target for TaskAdviser",
+  "scripts": {
+    "check": "node --check tgcloud/endpoints/health.js && node --check tgcloud/lib/import-data.js && node --check tgcloud/lib/table-counts.js && node --check tgcloud/schema.js",
+    "status": "tgcloud status",
+    "deploy": "tgcloud push"
+  },
+  "devDependencies": {
+    "@tgcloud/cli": "0.2.0"
+  }
+}

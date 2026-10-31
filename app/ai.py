@@ -348,8 +348,14 @@ class AIService:
         return plan
     async def summarize_meeting(self, text: str) -> str | None:
         data = await self._chat_json(
-            "You summarize Persian event messages into one short Persian line under 80 chars. "
-            "Include topic, time range if present, and day (امروز/فردا). Return JSON: {\"title\": \"...\"}",
+            "Extract only the meeting subject/topic from the ENTIRE Persian event message. "
+            "Ignore greetings, prayers, announcements, date, weekday, time, duration, attendee lists, "
+            "locations, signatures, hashtags, and boilerplate. Never use a name found only in an attendee "
+            "list (such as «افراد حاضر در جلسه») as the subject. If the subject is embedded in a long "
+            "announcement, identify the actual event or activity being scheduled. Attendance requests such "
+            "as «حضور داشته باشید» are never a subject. If no separate topic exists but the message says "
+            "«جلسه با ...», use the person phrase (for example «با جناب ملایی») as the title. Return one short Persian "
+            "title under 80 chars as JSON: {\"title\": \"...\"}",
             text,
         )
         title = (data or {}).get("title")
@@ -366,7 +372,9 @@ class AIService:
             "Extract date and time independently from any line or sentence, regardless of order or formatting. "
             "Use Asia/Tehran timezone. Relative-day words are exact: امروز means the calendar date of Now, "
             "فردا means exactly Now's calendar date plus 1 day, and پس‌فردا means exactly plus 2 days; "
-            "never add an extra day and do not infer these from UTC. If end time missing, assume 1 hour after start.",
+            "never add an extra day and do not infer these from UTC. Resolve a named Persian weekday as its "
+            "first future occurrence from Now and verify that the returned ISO date actually has that weekday. "
+            "If end time missing, assume 1 hour after start.",
             f"Now: {now.isoformat()}\nTimezone: {timezone}\nText:\n{text}",
         )
         if not data:

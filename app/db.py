@@ -1,12 +1,20 @@
 from __future__ import annotations
 
 from contextlib import asynccontextmanager
-from datetime import date, datetime, timedelta, timezone
+from datetime import date, datetime, time, timedelta, timezone
 from pathlib import Path
 
 import aiosqlite
 
 from app.models import Meeting, Priority, Reminder, Task
+
+
+def _canonical_meeting_title(value: str) -> str:
+    normalized = " ".join((value or "").replace("ي", "ی").replace("ك", "ک").split()).casefold()
+    for prefix in ("جلسات ", "جلسه "):
+        if normalized.startswith(prefix):
+            normalized = normalized[len(prefix):].strip()
+    return normalized
 
 
 _TASK_COLUMNS = """
@@ -89,6 +97,7 @@ class Database:
                     repeat_until TEXT,
                     active INTEGER NOT NULL DEFAULT 1,
                     last_notified_at TEXT,
+                    last_warning_sent_for_due_at TEXT,
                     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
                 );
                 CREATE INDEX IF NOT EXISTS idx_reminders_due
@@ -129,10 +138,22 @@ class Database:
                 CREATE TABLE IF NOT EXISTS access_codes (
                     code TEXT PRIMARY KEY COLLATE NOCASE,
                     active INTEGER NOT NULL DEFAULT 1,
+                    usage_type TEXT NOT NULL DEFAULT 'single'
+                        CHECK(usage_type IN ('single', 'multi')),
+                    max_uses INTEGER NOT NULL DEFAULT 1 CHECK(max_uses > 0),
                     redeemed_by INTEGER,
                     redeemed_at TEXT,
                     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
                 );
+                CREATE TABLE IF NOT EXISTS access_code_usages (
+                    code TEXT NOT NULL COLLATE NOCASE,
+                    user_id INTEGER NOT NULL,
+                    display_name TEXT NOT NULL DEFAULT '',
+                    redeemed_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    PRIMARY KEY(code, user_id)
+                );
+                CREATE INDEX IF NOT EXISTS idx_access_code_usages_code
+                    ON access_code_usages(code, redeemed_at);
                 CREATE TABLE IF NOT EXISTS team_members (
                     manager_id INTEGER NOT NULL,
                     member_id INTEGER NOT NULL,
@@ -205,6 +226,31 @@ class Database:
                     display_name TEXT NOT NULL DEFAULT '',
                     updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
                 );
+                CREATE TABLE IF NOT EXISTS platform_accounts (
+                    platform TEXT NOT NULL,
+                    platform_user_id INTEGER NOT NULL,
+                    canonical_user_id INTEGER NOT NULL,
+                    username TEXT,
+                    display_name TEXT NOT NULL DEFAULT '',
+                    linked_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    PRIMARY KEY(platform, platform_user_id)
+                );
+                CREATE INDEX IF NOT EXISTS idx_platform_accounts_canonical
+                    ON platform_accounts(canonical_user_id, platform);
+                CREATE TABLE IF NOT EXISTS platform_link_codes (
+                    code TEXT PRIMARY KEY,
+                    canonical_user_id INTEGER NOT NULL,
+                    source_platform TEXT NOT NULL,
+                    expires_at TEXT NOT NULL,
+                    used_at TEXT
+                );
+                CREATE INDEX IF NOT EXISTS idx_platform_link_codes_expiry
+                    ON platform_link_codes(expires_at, used_at);
+                INSERT OR IGNORE INTO platform_accounts(
+                    platform,platform_user_id,canonical_user_id,username,display_name
+                )
+                SELECT 'telegram',user_id,user_id,username,display_name FROM telegram_accounts;
                 CREATE UNIQUE INDEX IF NOT EXISTS idx_telegram_username
                     ON telegram_accounts(username) WHERE username IS NOT NULL;
                 CREATE TABLE IF NOT EXISTS task_progress_history (
@@ -235,6 +281,23 @@ class Database:
             await db.execute(
                 "UPDATE tasks SET last_changed_by=user_id WHERE last_changed_by IS NULL"
             )
+            access_code_columns = {
+                row[1] for row in await (await db.execute("PRAGMA table_info(access_codes)")).fetchall()
+            }
+            if "usage_type" not in access_code_columns:
+                await db.execute(
+                    "ALTER TABLE access_codes ADD COLUMN usage_type TEXT NOT NULL DEFAULT 'single'"
+                )
+            if "max_uses" not in access_code_columns:
+                await db.execute(
+                    "ALTER TABLE access_codes ADD COLUMN max_uses INTEGER NOT NULL DEFAULT 1"
+                )
+            await db.execute("""
+                INSERT OR IGNORE INTO access_code_usages(code,user_id,redeemed_at)
+                SELECT code,redeemed_by,COALESCE(redeemed_at,CURRENT_TIMESTAMP)
+                FROM access_codes
+                WHERE redeemed_by IS NOT NULL
+            """)
             await db.executescript("""
                 CREATE TABLE IF NOT EXISTS user_settings (
                     user_id INTEGER PRIMARY KEY,
@@ -248,6 +311,9 @@ class Database:
                     report_warning_hours INTEGER,
                     deadline_warning_days_list TEXT,
                     reminder_warning_days_list TEXT,
+                    meeting_default_duration INTEGER NOT NULL DEFAULT 60,
+                    meeting_window_start INTEGER NOT NULL DEFAULT 480,
+                    meeting_window_end INTEGER NOT NULL DEFAULT 1140,
                     updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
                 );
                 CREATE TABLE IF NOT EXISTS meeting_quiet_hours (
@@ -293,6 +359,27 @@ class Database:
                 await db.execute("ALTER TABLE user_settings ADD COLUMN deadline_warning_days_list TEXT")
             if "reminder_warning_days_list" not in user_setting_columns:
                 await db.execute("ALTER TABLE user_settings ADD COLUMN reminder_warning_days_list TEXT")
+            if "reminder_warning_enabled" not in user_setting_columns:
+                await db.execute("ALTER TABLE user_settings ADD COLUMN reminder_warning_enabled INTEGER NOT NULL DEFAULT 0")
+            if "reminder_warning_hour" not in user_setting_columns:
+                await db.execute("ALTER TABLE user_settings ADD COLUMN reminder_warning_hour INTEGER")
+            if "reminder_warning_minute" not in user_setting_columns:
+                await db.execute("ALTER TABLE user_settings ADD COLUMN reminder_warning_minute INTEGER")
+            if "meeting_default_duration" not in user_setting_columns:
+                await db.execute(
+                    "ALTER TABLE user_settings ADD COLUMN meeting_default_duration INTEGER NOT NULL DEFAULT 60"
+                )
+            if "meeting_window_start" not in user_setting_columns:
+                await db.execute(
+                    "ALTER TABLE user_settings ADD COLUMN meeting_window_start INTEGER NOT NULL DEFAULT 480"
+                )
+            if "meeting_window_end" not in user_setting_columns:
+                await db.execute(
+                    "ALTER TABLE user_settings ADD COLUMN meeting_window_end INTEGER NOT NULL DEFAULT 1140"
+                )
+            reminder_columns = [row[1] for row in await (await db.execute("PRAGMA table_info(reminders)")).fetchall()]
+            if "last_warning_sent_for_due_at" not in reminder_columns:
+                await db.execute("ALTER TABLE reminders ADD COLUMN last_warning_sent_for_due_at TEXT")
             # Older versions accidentally mirrored every task into reminders.
             # Remove those legacy one-shot mirrors exactly once; independent
             # reminders created afterwards must never be touched.
@@ -329,11 +416,51 @@ class Database:
                 UPDATE tasks SET completed_at=COALESCE(completed_at,updated_at,created_at)
                 WHERE status='done' AND completed_at IS NULL
             """)
-            await db.execute("DROP TABLE IF EXISTS google_connections")
-            await db.execute("DROP TABLE IF EXISTS oauth_states")
-            meeting_columns = [row[1] for row in await (await db.execute("PRAGMA table_info(meetings)")).fetchall()]
-            if "google_event_id" in meeting_columns:
-                await db.execute("ALTER TABLE meetings DROP COLUMN google_event_id")
+            # Google Calendar integration is deliberately kept in separate tables:
+            # meeting rows remain provider-agnostic and OAuth secrets can be removed
+            # without touching the user's schedule.
+            await db.executescript("""
+                CREATE TABLE IF NOT EXISTS google_connections (
+                    user_id INTEGER PRIMARY KEY,
+                    encrypted_refresh_token TEXT NOT NULL,
+                    account_email TEXT NOT NULL DEFAULT '',
+                    calendar_id TEXT NOT NULL DEFAULT 'primary',
+                    calendar_name TEXT NOT NULL DEFAULT 'تقویم اصلی',
+                    enabled INTEGER NOT NULL DEFAULT 1,
+                    connected_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                );
+                CREATE TABLE IF NOT EXISTS google_oauth_states (
+                    state TEXT PRIMARY KEY,
+                    user_id INTEGER NOT NULL,
+                    expires_at TEXT NOT NULL,
+                    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                );
+                CREATE TABLE IF NOT EXISTS google_meeting_links (
+                    meeting_id INTEGER PRIMARY KEY,
+                    user_id INTEGER NOT NULL,
+                    calendar_id TEXT NOT NULL,
+                    google_event_id TEXT NOT NULL,
+                    synced_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                );
+                CREATE INDEX IF NOT EXISTS idx_google_links_user
+                    ON google_meeting_links(user_id,calendar_id);
+                CREATE TABLE IF NOT EXISTS google_sync_queue (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    user_id INTEGER NOT NULL,
+                    meeting_id INTEGER NOT NULL,
+                    action TEXT NOT NULL CHECK(action IN ('upsert','delete')),
+                    calendar_id TEXT NOT NULL DEFAULT '',
+                    google_event_id TEXT NOT NULL DEFAULT '',
+                    attempts INTEGER NOT NULL DEFAULT 0,
+                    available_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    last_error TEXT NOT NULL DEFAULT '',
+                    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    UNIQUE(user_id,meeting_id,action,calendar_id)
+                );
+                CREATE INDEX IF NOT EXISTS idx_google_sync_ready
+                    ON google_sync_queue(available_at,id);
+            """)
             await db.commit()
 
     async def seed_owners(self, user_ids: frozenset[int]) -> None:
@@ -672,6 +799,105 @@ class Database:
                 (user_id, username.lower() if username else None, display_name))
             await db.commit()
 
+    async def canonical_platform_user_id(self, platform: str, platform_user_id: int) -> int:
+        """Return the shared account id; unlinked non-Telegram users get a safe namespace."""
+        platform = platform.strip().lower()
+        async with self._connect() as db:
+            row = await (await db.execute(
+                "SELECT canonical_user_id FROM platform_accounts WHERE platform=? AND platform_user_id=?",
+                (platform, platform_user_id),
+            )).fetchone()
+            if row:
+                return int(row[0])
+            canonical = platform_user_id if platform == "telegram" else 9_000_000_000_000_000 + platform_user_id
+            await db.execute(
+                "INSERT OR IGNORE INTO platform_accounts(platform,platform_user_id,canonical_user_id) VALUES(?,?,?)",
+                (platform, platform_user_id, canonical),
+            )
+            await db.commit()
+            return canonical
+
+    async def remember_platform_account(self, platform: str, platform_user_id: int,
+                                        username: str | None, display_name: str) -> int:
+        canonical = await self.canonical_platform_user_id(platform, platform_user_id)
+        async with self._connect() as db:
+            await db.execute("""
+                UPDATE platform_accounts SET username=?,display_name=?,updated_at=CURRENT_TIMESTAMP
+                WHERE platform=? AND platform_user_id=?
+            """, (username.lower() if username else None, display_name, platform, platform_user_id))
+            await db.commit()
+        return canonical
+
+    async def platform_recipient(self, platform: str, canonical_user_id: int) -> int | None:
+        async with self._connect() as db:
+            row = await (await db.execute(
+                "SELECT platform_user_id FROM platform_accounts WHERE platform=? AND canonical_user_id=?",
+                (platform.strip().lower(), canonical_user_id),
+            )).fetchone()
+        return int(row[0]) if row else None
+
+    async def platform_link_status(self, canonical_user_id: int) -> list[str]:
+        async with self._connect() as db:
+            rows = await (await db.execute(
+                "SELECT platform FROM platform_accounts WHERE canonical_user_id=? ORDER BY platform",
+                (canonical_user_id,),
+            )).fetchall()
+        return [str(row[0]) for row in rows]
+
+    async def create_platform_link_code(self, canonical_user_id: int, source_platform: str,
+                                        code: str, expires_at: datetime) -> None:
+        async with self._connect() as db:
+            await db.execute(
+                "DELETE FROM platform_link_codes WHERE canonical_user_id=? OR expires_at<=? OR used_at IS NOT NULL",
+                (canonical_user_id, datetime.now(timezone.utc).isoformat()),
+            )
+            await db.execute("""
+                INSERT INTO platform_link_codes(code,canonical_user_id,source_platform,expires_at)
+                VALUES(?,?,?,?)
+            """, (code, canonical_user_id, source_platform, expires_at.isoformat()))
+            await db.commit()
+
+    async def consume_platform_link_code(self, code: str, target_platform: str,
+                                         target_user_id: int, username: str | None,
+                                         display_name: str) -> int | None:
+        """Atomically consume a valid cross-platform code and return the shared account id."""
+        now = datetime.now(timezone.utc).isoformat()
+        target_platform = target_platform.strip().lower()
+        async with self._connect() as db:
+            await db.execute("BEGIN IMMEDIATE")
+            row = await (await db.execute("""
+                SELECT canonical_user_id,source_platform FROM platform_link_codes
+                WHERE code=? AND used_at IS NULL AND expires_at>?
+            """, (code, now))).fetchone()
+            if not row or row[1] == target_platform:
+                await db.rollback()
+                return None
+            canonical = int(row[0])
+            await db.execute("""
+                INSERT INTO platform_accounts(platform,platform_user_id,canonical_user_id,username,display_name)
+                VALUES(?,?,?,?,?)
+                ON CONFLICT(platform,platform_user_id) DO UPDATE SET
+                    canonical_user_id=excluded.canonical_user_id,username=excluded.username,
+                    display_name=excluded.display_name,linked_at=CURRENT_TIMESTAMP,
+                    updated_at=CURRENT_TIMESTAMP
+            """, (target_platform, target_user_id, canonical,
+                  username.lower() if username else None, display_name))
+            await db.execute("UPDATE platform_link_codes SET used_at=? WHERE code=?", (now, code))
+            await db.commit()
+            return canonical
+
+    async def unlink_platform(self, canonical_user_id: int, platform: str) -> bool:
+        """Detach a non-Telegram endpoint while preserving the canonical Telegram data."""
+        if platform == "telegram":
+            return False
+        async with self._connect() as db:
+            cursor = await db.execute(
+                "DELETE FROM platform_accounts WHERE canonical_user_id=? AND platform=?",
+                (canonical_user_id, platform),
+            )
+            await db.commit()
+            return bool(cursor.rowcount)
+
     async def telegram_account_by_username(self, username: str) -> tuple[int, str] | None:
         clean = username.strip().lstrip("@").lower()
         async with self._connect() as db:
@@ -685,14 +911,18 @@ class Database:
             row = await (await db.execute("""
                 SELECT digest_hour,digest_minute,morning_hour,morning_minute,
                        deadline_warning_days,report_warning_hours,digest_enabled,morning_enabled,
-                       deadline_warning_days_list,reminder_warning_days_list
+                       deadline_warning_days_list,reminder_warning_days_list,
+                       reminder_warning_enabled,reminder_warning_hour,reminder_warning_minute,
+                       meeting_default_duration,meeting_window_start,meeting_window_end
                 FROM user_settings WHERE user_id=?
             """, (user_id,))).fetchone()
         if not row:
             return dict(defaults)
         keys = ("digest_hour", "digest_minute", "morning_hour", "morning_minute",
                 "deadline_warning_days", "report_warning_hours", "digest_enabled", "morning_enabled",
-                "deadline_warning_days_list", "reminder_warning_days_list")
+                "deadline_warning_days_list", "reminder_warning_days_list",
+                "reminder_warning_enabled", "reminder_warning_hour", "reminder_warning_minute",
+                "meeting_default_duration", "meeting_window_start", "meeting_window_end")
         result = dict(defaults)
         for index, key in enumerate(keys):
             if row[index] is not None:
@@ -703,7 +933,9 @@ class Database:
         allowed = {
             "digest_hour", "digest_minute", "morning_hour", "morning_minute",
             "deadline_warning_days", "report_warning_hours",
-            "digest_enabled", "morning_enabled",
+            "digest_enabled", "morning_enabled", "reminder_warning_enabled",
+            "reminder_warning_hour", "reminder_warning_minute", "meeting_default_duration",
+            "meeting_window_start", "meeting_window_end",
         }
         if key not in allowed:
             raise ValueError("تنظیم نامعتبر")
@@ -712,6 +944,38 @@ class Database:
             await db.execute(
                 f"UPDATE user_settings SET {key}=?, updated_at=CURRENT_TIMESTAMP WHERE user_id=?",
                 (value, user_id),
+            )
+            await db.commit()
+
+    async def disable_meeting_notifications(self, user_id: int) -> None:
+        """Stop morning/digest retries after Telegram reports a blocked bot."""
+        async with self._connect() as db:
+            await db.execute(
+                "INSERT OR IGNORE INTO user_settings(user_id) VALUES(?)", (user_id,)
+            )
+            await db.execute(
+                """UPDATE user_settings
+                   SET digest_enabled=0, morning_enabled=0,
+                       updated_at=CURRENT_TIMESTAMP
+                   WHERE user_id=?""",
+                (user_id,),
+            )
+            await db.commit()
+
+    async def update_meeting_window(self, user_id: int, start_minute: int, end_minute: int) -> None:
+        start_minute = int(start_minute)
+        end_minute = int(end_minute)
+        if not (0 <= start_minute < end_minute <= 1440):
+            raise ValueError("بازهٔ زمانی جلسه نامعتبر است")
+        if start_minute % 60 or end_minute % 60:
+            raise ValueError("بازهٔ پیشنهاد جلسه باید روی ساعت کامل باشد")
+        async with self._connect() as db:
+            await db.execute("INSERT OR IGNORE INTO user_settings(user_id) VALUES(?)", (user_id,))
+            await db.execute(
+                """UPDATE user_settings
+                   SET meeting_window_start=?, meeting_window_end=?, updated_at=CURRENT_TIMESTAMP
+                   WHERE user_id=?""",
+                (start_minute, end_minute, user_id),
             )
             await db.commit()
 
@@ -889,24 +1153,86 @@ class Database:
             )).fetchall()
         return [row[0] for row in rows]
 
-    async def create_access_code(self, code: str) -> None:
+    async def create_access_code(
+        self, code: str, usage_type: str = "single", max_uses: int = 1
+    ) -> None:
+        usage_type = usage_type.lower().strip()
+        if usage_type not in {"single", "multi"}:
+            raise ValueError("usage_type must be 'single' or 'multi'")
+        max_uses = int(max_uses)
+        if max_uses < 1:
+            raise ValueError("max_uses must be positive")
+        if usage_type == "single":
+            max_uses = 1
+        code = code.upper()
         async with self._connect() as db:
-            await db.execute("""INSERT INTO access_codes(code,active) VALUES(?,1)
-                ON CONFLICT(code) DO UPDATE SET active=1,redeemed_by=NULL,redeemed_at=NULL""", (code.upper(),))
+            await db.execute("""INSERT INTO access_codes(code,active,usage_type,max_uses) VALUES(?,1,?,?)
+                ON CONFLICT(code) DO UPDATE SET
+                    active=1, usage_type=excluded.usage_type,
+                    max_uses=excluded.max_uses,
+                    redeemed_by=NULL, redeemed_at=NULL""", (code, usage_type, max_uses))
+            await db.execute("DELETE FROM access_code_usages WHERE code=?", (code,))
             await db.commit()
 
     async def redeem_access_code(self, code: str, user_id: int, display_name: str = "") -> bool:
+        code = code.upper()
         async with self._connect() as db:
-            cursor = await db.execute("""UPDATE access_codes
-                SET active=0,redeemed_by=?,redeemed_at=CURRENT_TIMESTAMP
-                WHERE code=? AND active=1""", (user_id, code.upper()))
-            if cursor.rowcount == 0:
+            row = await (await db.execute(
+                "SELECT usage_type,max_uses,active FROM access_codes WHERE code=?", (code,)
+            )).fetchone()
+            if row is None:
                 await db.rollback()
                 return False
+            usage_type, max_uses, active = row
+            if usage_type == "single":
+                if not active:
+                    await db.rollback()
+                    return False
+                cursor = await db.execute("""UPDATE access_codes
+                    SET active=0,redeemed_by=?,redeemed_at=CURRENT_TIMESTAMP
+                    WHERE code=? AND active=1""", (user_id, code))
+                if cursor.rowcount == 0:
+                    await db.rollback()
+                    return False
+            else:
+                existing_usage = await (await db.execute("""
+                    SELECT 1 FROM access_code_usages WHERE code=? AND user_id=?
+                """, (code, user_id))).fetchone()
+                if existing_usage:
+                    await db.execute("""INSERT INTO users(user_id,role,display_name,access_granted)
+                        VALUES(?, 'manager', ?, 1)
+                        ON CONFLICT(user_id) DO UPDATE SET
+                            display_name=excluded.display_name,access_granted=1""",
+                        (user_id, display_name))
+                    await db.commit()
+                    return True
+                if not active:
+                    await db.rollback()
+                    return False
+                cursor = await db.execute("""UPDATE access_codes
+                    SET redeemed_by=COALESCE(redeemed_by,?),
+                        redeemed_at=COALESCE(redeemed_at,CURRENT_TIMESTAMP)
+                    WHERE code=? AND active=1
+                      AND (
+                          SELECT COUNT(*) FROM access_code_usages
+                          WHERE access_code_usages.code=access_codes.code
+                      ) < max_uses""", (user_id, code))
+                if cursor.rowcount == 0:
+                    await db.rollback()
+                    return False
+            await db.execute("""INSERT INTO access_code_usages(code,user_id,display_name)
+                VALUES(?,?,?)
+                ON CONFLICT(code,user_id) DO UPDATE SET display_name=excluded.display_name""",
+                (code, user_id, display_name))
             await db.execute("""INSERT INTO users(user_id,role,display_name,access_granted)
                 VALUES(?, 'manager', ?, 1)
                 ON CONFLICT(user_id) DO UPDATE SET
                     display_name=excluded.display_name,access_granted=1""", (user_id, display_name))
+            if usage_type == "multi":
+                await db.execute("""UPDATE access_codes SET active=0
+                    WHERE code=? AND usage_type='multi'
+                      AND (SELECT COUNT(*) FROM access_code_usages
+                           WHERE access_code_usages.code=access_codes.code) >= max_uses""", (code,))
             await db.commit()
             return True
 
@@ -916,6 +1242,40 @@ class Database:
                 "SELECT code,active FROM access_codes ORDER BY created_at DESC"
             )).fetchall()
         return [(row[0], bool(row[1])) for row in rows]
+
+    async def access_code_details(self) -> list[tuple[str, bool, str, int, list[int]]]:
+        """Return every code with capacity and unique Telegram IDs."""
+        async with self._connect() as db:
+            codes = await (await db.execute(
+                "SELECT code,active,usage_type,max_uses FROM access_codes ORDER BY created_at DESC"
+            )).fetchall()
+            usages = await (await db.execute(
+                "SELECT code,user_id FROM access_code_usages ORDER BY redeemed_at ASC"
+            )).fetchall()
+        users_by_code: dict[str, list[int]] = {}
+        for code, user_id in usages:
+            users_by_code.setdefault(code.upper(), []).append(user_id)
+        return [
+            (code, bool(active), usage_type, max_uses, users_by_code.get(code.upper(), []))
+            for code, active, usage_type, max_uses in codes
+        ]
+
+    async def extend_access_code_capacity(self, code: str, additional_uses: int) -> int | None:
+        additional_uses = int(additional_uses)
+        if additional_uses < 1:
+            raise ValueError("additional_uses must be positive")
+        async with self._connect() as db:
+            cursor = await db.execute("""UPDATE access_codes
+                SET max_uses=max_uses+?, active=1
+                WHERE code=? AND usage_type='multi'""", (additional_uses, code.upper()))
+            if cursor.rowcount == 0:
+                await db.rollback()
+                return None
+            row = await (await db.execute(
+                "SELECT max_uses FROM access_codes WHERE code=?", (code.upper(),)
+            )).fetchone()
+            await db.commit()
+        return row[0] if row else None
 
     async def deactivate_access_code(self, code: str) -> None:
         async with self._connect() as db:
@@ -970,10 +1330,14 @@ class Database:
         import json
         count = 0
         async with self._connect() as db:
-            rows = await (await db.execute("SELECT id,user_id,title,anchor,priority,assignee,note,interval,weekdays,frequency,jalali_day,ends_on FROM recurrence_series WHERE active=1")).fetchall()
+            rows = await (await db.execute("""SELECT s.id,s.user_id,s.title,s.anchor,
+                s.priority,s.assignee,s.note,s.interval,s.weekdays,s.frequency,s.jalali_day,s.ends_on,
+                COALESCE((SELECT MAX(o.occurrence_at) FROM recurrence_occurrences o
+                          WHERE o.series_id=s.id),s.anchor)
+                FROM recurrence_series s WHERE s.active=1""")).fetchall()
             for r in rows:
-                sid,uid,title,anchor_s,priority,assignee,note,interval,weekdays,frequency,jday,ends = r
-                anchor = datetime.fromisoformat(anchor_s); cursor = anchor
+                sid,uid,title,anchor_s,priority,assignee,note,interval,weekdays,frequency,jday,ends,cursor_s = r
+                anchor = datetime.fromisoformat(anchor_s); cursor = datetime.fromisoformat(cursor_s)
                 while True:
                     effective_interval = 1 if frequency == "daily" else interval
                     nxt = next_occurrence(anchor,cursor,RecurrenceRule(frequency,effective_interval,tuple(json.loads(weekdays or "[]")),jday,date.fromisoformat(ends) if ends else None))
@@ -997,6 +1361,46 @@ class Database:
             cur = await db.execute("UPDATE recurrence_series SET active=0 WHERE id=? AND user_id=?", (series_id,user_id))
             await db.commit()
         return cur.rowcount > 0
+
+    async def _queue_google_upsert(self, conn, user_id: int, meeting_id: int) -> None:
+        """Coalesce repeated edits while keeping the enqueue in the meeting transaction."""
+        await conn.execute(
+            """INSERT INTO google_sync_queue(user_id,meeting_id,action)
+               VALUES(?,?,'upsert')
+               ON CONFLICT(user_id,meeting_id,action,calendar_id) DO UPDATE SET
+                 attempts=0,available_at=CURRENT_TIMESTAMP,last_error=''""",
+            (user_id, meeting_id),
+        )
+
+    async def _queue_google_delete(self, conn, user_id: int, meeting_id: int) -> None:
+        link = await (await conn.execute(
+            """SELECT calendar_id,google_event_id FROM google_meeting_links
+               WHERE meeting_id=? AND user_id=?""",
+            (meeting_id, user_id),
+        )).fetchone()
+        if link:
+            calendar_id, event_id = str(link[0]), str(link[1])
+        else:
+            connection = await (await conn.execute(
+                "SELECT calendar_id FROM google_connections WHERE user_id=? AND enabled=1",
+                (user_id,),
+            )).fetchone()
+            calendar_id, event_id = (str(connection[0]), "") if connection else ("", "")
+        await conn.execute(
+            "DELETE FROM google_sync_queue WHERE user_id=? AND meeting_id=? AND action='upsert'",
+            (user_id, meeting_id),
+        )
+        if calendar_id:
+            await conn.execute(
+                """INSERT INTO google_sync_queue
+                   (user_id,meeting_id,action,calendar_id,google_event_id)
+                   VALUES(?,?,'delete',?,?)
+                   ON CONFLICT(user_id,meeting_id,action,calendar_id) DO UPDATE SET
+                     google_event_id=excluded.google_event_id,attempts=0,
+                     available_at=CURRENT_TIMESTAMP,last_error=''""",
+                (user_id, meeting_id, calendar_id, event_id),
+            )
+
     async def add_meeting(self, user_id: int, title: str, starts_at: datetime,
                           ends_at: datetime, source_text: str) -> int:
         async with self._connect() as db:
@@ -1004,8 +1408,10 @@ class Database:
                 "INSERT INTO meetings(user_id,title,starts_at,ends_at,source_text) VALUES(?,?,?,?,?)",
                 (user_id, title, starts_at.isoformat(), ends_at.isoformat(), source_text),
             )
+            meeting_id = int(cursor.lastrowid)
+            await self._queue_google_upsert(db, user_id, meeting_id)
             await db.commit()
-            return cursor.lastrowid
+            return meeting_id
 
     async def create_meeting_recurrence(
         self, user_id: int, title: str, starts_at: datetime, ends_at: datetime,
@@ -1040,6 +1446,7 @@ class Database:
                 "INSERT INTO meeting_recurrence_occurrences(series_id,meeting_id,occurrence_at) VALUES(?,?,?)",
                 (series_id, meeting_id, starts_at.isoformat()),
             )
+            await self._queue_google_upsert(db, user_id, meeting_id)
             await db.commit()
         return series_id, meeting_id
 
@@ -1049,14 +1456,17 @@ class Database:
         created = 0
         async with self._connect() as db:
             rows = await (await db.execute(
-                """SELECT id,user_id,title,source_text,anchor_start,anchor_end,interval,
-                          weekdays,frequency,jalali_day,ends_on
-                   FROM meeting_recurrence_series WHERE active=1"""
+                """SELECT s.id,s.user_id,s.title,s.source_text,s.anchor_start,s.anchor_end,
+                          s.interval,s.weekdays,s.frequency,s.jalali_day,s.ends_on,
+                          COALESCE((SELECT MAX(o.occurrence_at)
+                                    FROM meeting_recurrence_occurrences o
+                                    WHERE o.series_id=s.id),s.anchor_start)
+                   FROM meeting_recurrence_series s WHERE s.active=1"""
             )).fetchall()
             for row in rows:
-                sid, uid, title, source, anchor_s, end_s, interval, weekdays_s, frequency, jday, ends_s = row
+                sid, uid, title, source, anchor_s, end_s, interval, weekdays_s, frequency, jday, ends_s, cursor_s = row
                 anchor = datetime.fromisoformat(anchor_s)
-                cursor = anchor
+                cursor = datetime.fromisoformat(cursor_s)
                 rule = RecurrenceRule(
                     frequency, interval, tuple(json.loads(weekdays_s or "[]")),
                     jday, date.fromisoformat(ends_s) if ends_s else None,
@@ -1079,6 +1489,7 @@ class Database:
                             "INSERT INTO meeting_recurrence_occurrences(series_id,meeting_id,occurrence_at) VALUES(?,?,?)",
                             (sid, int(cur.lastrowid), nxt.isoformat()),
                         )
+                        await self._queue_google_upsert(db, int(uid), int(cur.lastrowid))
                         created += 1
                     cursor = nxt
             await db.commit()
@@ -1114,6 +1525,18 @@ class Database:
                 "weekdays": json.loads(row[3] or "[]"), "jalali_day": row[4],
                 "ends_on": row[5], "active": bool(row[6])}
 
+    async def active_meeting_recurrence_ids_by_title(self, user_id: int, title: str) -> list[int]:
+        """Find active series for the same logical title (DBA == جلسات DBA)."""
+        wanted = _canonical_meeting_title(title)
+        if not wanted:
+            return []
+        async with self._connect() as db:
+            rows = await (await db.execute(
+                "SELECT id,title FROM meeting_recurrence_series WHERE user_id=? AND active=1",
+                (user_id,),
+            )).fetchall()
+        return [int(row[0]) for row in rows if _canonical_meeting_title(str(row[1])) == wanted]
+
     async def set_meeting_recurrence_active(
         self, series_id: int, user_id: int, active: bool,
     ) -> bool:
@@ -1129,6 +1552,8 @@ class Database:
                        WHERE series_id=? AND occurrence_at>?""",
                     (series_id, cutoff),
                 )).fetchall()
+                for row in future:
+                    await self._queue_google_delete(db, user_id, int(row[0]))
                 await db.executemany(
                     "DELETE FROM meetings WHERE id=?",
                     [(int(row[0]),) for row in future],
@@ -1161,6 +1586,8 @@ class Database:
                    WHERE series_id=? AND occurrence_at>?""",
                 (series_id, cutoff),
             )).fetchall()
+            for row in future:
+                await self._queue_google_delete(db, user_id, int(row[0]))
             await db.executemany(
                 "DELETE FROM meetings WHERE id=?",
                 [(int(row[0]),) for row in future],
@@ -1193,10 +1620,17 @@ class Database:
         return [self._task_from_row(row) for row in rows]
 
     async def query_tasks(self, user_id: int, filters: dict, sort: str = "deadline_asc",
-                          limit: int = 20, now: datetime | None = None) -> list[Task]:
+                          limit: int = 20, now: datetime | None = None,
+                          include_unassigned: bool = True,
+                          include_done: bool = True) -> list[Task]:
         query = f"SELECT {_TASK_COLUMNS} FROM tasks t {_TASK_ACTOR_JOINS} WHERE t.user_id=?"
         params: list[object] = [user_id]
+        if not include_unassigned:
+            query += " AND NOT (t.assignee='' AND t.assignee_user_id IS NULL)"
+        if not include_done:
+            query += " AND t.status!='done'"
         comparisons = {
+            "progress_eq": "progress=?",
             "progress_lt": "progress<?", "progress_lte": "progress<=?",
             "progress_gt": "progress>?", "progress_gte": "progress>=?",
         }
@@ -1261,8 +1695,9 @@ class Database:
     ) -> int:
         async with self._connect() as db:
             cursor = await db.execute(
-                """INSERT INTO reminders(user_id,title,due_at,repeat_type,repeat_until,active,last_notified_at)
-                   VALUES(?,?,?,?,?,1,NULL)""",
+                """INSERT INTO reminders(user_id,title,due_at,repeat_type,repeat_until,active,
+                   last_notified_at,last_warning_sent_for_due_at)
+                   VALUES(?,?,?,?,?,1,NULL,NULL)""",
                 (user_id, title.strip()[:200], due_at.isoformat(), repeat_type,
                  repeat_until.isoformat() if repeat_until else None),
             )
@@ -1277,13 +1712,23 @@ class Database:
             )).fetchone()
         return self._reminder_from_row(row) if row else None
 
-    async def reminders(self, user_id: int, limit: int = 100) -> list[Reminder]:
+    async def reminders(
+        self, user_id: int, limit: int = 100, now: datetime | None = None,
+        within_days: int | None = None,
+    ) -> list[Reminder]:
+        query = """SELECT id,user_id,title,due_at,repeat_type,repeat_until,active
+                   FROM reminders WHERE user_id=? AND active=1"""
+        params: list[object] = [user_id]
+        if within_days is not None:
+            if within_days <= 0:
+                raise ValueError("بازه زمانی یادآور نامعتبر است")
+            reference = now or datetime.now().astimezone()
+            query += " AND due_at>=? AND due_at<=?"
+            params.extend((reference.isoformat(), (reference + timedelta(days=within_days)).isoformat()))
+        query += " ORDER BY due_at,id LIMIT ?"
+        params.append(limit)
         async with self._connect() as db:
-            rows = await (await db.execute(
-                """SELECT id,user_id,title,due_at,repeat_type,repeat_until,active
-                   FROM reminders WHERE user_id=? AND active=1
-                   ORDER BY due_at,id LIMIT ?""", (user_id, limit)
-            )).fetchall()
+            rows = await (await db.execute(query, params)).fetchall()
         return [self._reminder_from_row(row) for row in rows]
 
     async def update_reminder(
@@ -1293,7 +1738,8 @@ class Database:
         async with self._connect() as db:
             cursor = await db.execute(
                 """UPDATE reminders SET title=?,due_at=?,repeat_type=?,repeat_until=?,
-                   active=1,last_notified_at=NULL WHERE id=? AND user_id=?""",
+                   active=1,last_notified_at=NULL,last_warning_sent_for_due_at=NULL
+                   WHERE id=? AND user_id=?""",
                 (title.strip()[:200], due_at.isoformat(), repeat_type,
                  repeat_until.isoformat() if repeat_until else None, reminder_id, user_id),
             )
@@ -1352,7 +1798,8 @@ class Database:
         active = bool(next_due and (current.repeat_until is None or next_due <= current.repeat_until))
         async with self._connect() as db:
             cursor = await db.execute(
-                """UPDATE reminders SET due_at=?,active=?,last_notified_at=NULL
+                """UPDATE reminders SET due_at=?,active=?,last_notified_at=NULL,
+                   last_warning_sent_for_due_at=NULL
                    WHERE id=? AND user_id=? AND active=1""",
                 ((next_due or current.due_at).isoformat(), int(active), reminder_id, user_id),
             )
@@ -1368,6 +1815,55 @@ class Database:
                    ORDER BY due_at,id""", (now.isoformat(),)
             )).fetchall()
         return [self._reminder_from_row(row) for row in rows]
+
+    async def due_reminder_warnings(
+        self, now: datetime, default_hour: int, default_minute: int,
+    ) -> list[Reminder]:
+        async with self._connect() as db:
+            rows = await (await db.execute(
+                """SELECT id,user_id,title,due_at,repeat_type,repeat_until,active,
+                          last_warning_sent_for_due_at
+                   FROM reminders WHERE active=1 AND due_at>? ORDER BY due_at,id""",
+                (now.isoformat(),),
+            )).fetchall()
+        result: list[Reminder] = []
+        config_cache: dict[int, dict[str, int]] = {}
+        for row in rows:
+            reminder = self._reminder_from_row(row)
+            if reminder.user_id not in config_cache:
+                config_cache[reminder.user_id] = await self.user_settings(
+                    reminder.user_id,
+                    {
+                        "reminder_warning_enabled": 0,
+                        "reminder_warning_hour": default_hour,
+                        "reminder_warning_minute": default_minute,
+                    },
+                )
+            config = config_cache[reminder.user_id]
+            if not config.get("reminder_warning_enabled"):
+                continue
+            try:
+                warning_at = datetime.combine(
+                    reminder.due_at.astimezone(now.tzinfo).date() - timedelta(days=1),
+                    time(int(config.get("reminder_warning_hour", default_hour)),
+                         int(config.get("reminder_warning_minute", default_minute))),
+                    tzinfo=now.tzinfo,
+                )
+            except (TypeError, ValueError):
+                continue
+            if warning_at <= now < reminder.due_at and row[7] != reminder.due_at.isoformat():
+                result.append(reminder)
+        return result
+
+    async def mark_reminder_warning_sent(
+        self, reminder_id: int, due_at: datetime, now: datetime,
+    ) -> None:
+        async with self._connect() as db:
+            await db.execute(
+                "UPDATE reminders SET last_warning_sent_for_due_at=? WHERE id=? AND due_at=?",
+                (due_at.isoformat(), reminder_id, due_at.isoformat()),
+            )
+            await db.commit()
 
     async def deadline_warning_days(self, user_id: int, default: int) -> list[int]:
         cfg = await self.user_settings(
@@ -1398,13 +1894,16 @@ class Database:
             )).fetchall()
         sent = {(int(task_id), int(days)) for task_id, days in sent_rows}
         result: list[tuple[Task, int]] = []
+        warning_days_cache: dict[int, list[int]] = {}
         for row in rows:
             task = self._task_from_row(row)
             deadline_local = task.deadline.astimezone(now.tzinfo)
             remaining_days = (deadline_local.date() - now.date()).days
-            warning_days = await self.deadline_warning_days(
-                task.user_id, default_warning_days
-            )
+            if task.user_id not in warning_days_cache:
+                warning_days_cache[task.user_id] = await self.deadline_warning_days(
+                    task.user_id, default_warning_days
+                )
+            warning_days = warning_days_cache[task.user_id]
             for days in warning_days:
                 if days == remaining_days and (
                     task.id, days
@@ -1669,17 +2168,53 @@ class Database:
             rows = await (await db.execute(query, params)).fetchall()
         return [Meeting(r[0], r[1], r[2], datetime.fromisoformat(r[3]), datetime.fromisoformat(r[4]), r[5]) for r in rows]
 
+    async def move_meeting_segments(self, meeting_id: int, user_id: int, segments: list) -> bool:
+        """Move related sessions together and queue every Google update atomically."""
+        async with self._connect() as connection:
+            row = await (await connection.execute(
+                "SELECT title,source_text,starts_at FROM meetings WHERE id=? AND user_id=?",
+                (meeting_id, user_id),
+            )).fetchone()
+            if not row:
+                return False
+            rows = [(meeting_id,)]
+            if row[1]:
+                rows = await (await connection.execute(
+                    "SELECT id FROM meetings WHERE user_id=? AND title=? AND source_text=? AND substr(starts_at,1,10)=? ORDER BY starts_at,id",
+                    (user_id, row[0], row[1], row[2][:10]),
+                )).fetchall()
+            if len(rows) > len(segments):
+                return False
+            for index, (start, end) in enumerate(segments):
+                if index < len(rows):
+                    item_id = rows[index][0]
+                    await connection.execute("UPDATE meetings SET starts_at=?,ends_at=? WHERE id=? AND user_id=?", (start, end, item_id, user_id))
+                else:
+                    cursor = await connection.execute("INSERT INTO meetings(user_id,title,starts_at,ends_at,source_text) VALUES(?,?,?,?,?)", (user_id, row[0], start, end, row[1]))
+                    item_id = cursor.lastrowid
+                await self._queue_google_upsert(connection, user_id, item_id)
+            await connection.commit()
+            return True
+
     async def move_meeting(self, meeting_id: int, user_id: int, starts_at: datetime, ends_at: datetime) -> bool:
         async with self._connect() as db:
             cursor = await db.execute(
                 "UPDATE meetings SET starts_at=?, ends_at=? WHERE id=? AND user_id=?",
                 (starts_at.isoformat(), ends_at.isoformat(), meeting_id, user_id),
             )
+            if cursor.rowcount:
+                await self._queue_google_upsert(db, user_id, meeting_id)
             await db.commit()
             return cursor.rowcount > 0
 
     async def delete_meeting(self, meeting_id: int, user_id: int) -> bool:
         async with self._connect() as db:
+            exists = await (await db.execute(
+                "SELECT 1 FROM meetings WHERE id=? AND user_id=?", (meeting_id, user_id)
+            )).fetchone()
+            if not exists:
+                return False
+            await self._queue_google_delete(db, user_id, meeting_id)
             await db.execute(
                 "UPDATE meeting_recurrence_occurrences SET skipped=1 WHERE meeting_id=?",
                 (meeting_id,),
@@ -1689,6 +2224,292 @@ class Database:
             )
             await db.commit()
             return cursor.rowcount > 0
+
+    async def create_google_oauth_state(
+        self, state: str, user_id: int, expires_at: datetime,
+    ) -> None:
+        async with self._connect() as conn:
+            await conn.execute("DELETE FROM google_oauth_states WHERE expires_at<=CURRENT_TIMESTAMP")
+            await conn.execute(
+                "INSERT INTO google_oauth_states(state,user_id,expires_at) VALUES(?,?,?)",
+                (state, user_id, expires_at.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")),
+            )
+            await conn.commit()
+
+    async def consume_google_oauth_state(self, state: str) -> int | None:
+        async with self._connect() as conn:
+            row = await (await conn.execute(
+                "SELECT user_id FROM google_oauth_states WHERE state=? AND expires_at>CURRENT_TIMESTAMP",
+                (state,),
+            )).fetchone()
+            await conn.execute("DELETE FROM google_oauth_states WHERE state=?", (state,))
+            await conn.commit()
+        return int(row[0]) if row else None
+
+    async def google_connection(self, user_id: int) -> dict | None:
+        async with self._connect() as conn:
+            row = await (await conn.execute(
+                """SELECT encrypted_refresh_token,account_email,calendar_id,calendar_name,enabled
+                   FROM google_connections WHERE user_id=?""",
+                (user_id,),
+            )).fetchone()
+        if not row:
+            return None
+        return {
+            "encrypted_refresh_token": row[0], "account_email": row[1],
+            "calendar_id": row[2], "calendar_name": row[3], "enabled": bool(row[4]),
+        }
+
+    async def save_google_connection(
+        self, user_id: int, encrypted_refresh_token: str, account_email: str = "",
+    ) -> None:
+        async with self._connect() as conn:
+            await conn.execute(
+                """INSERT INTO google_connections
+                   (user_id,encrypted_refresh_token,account_email,enabled)
+                   VALUES(?,?,?,1)
+                   ON CONFLICT(user_id) DO UPDATE SET
+                     encrypted_refresh_token=excluded.encrypted_refresh_token,
+                     account_email=excluded.account_email,enabled=1,
+                     updated_at=CURRENT_TIMESTAMP""",
+                (user_id, encrypted_refresh_token, account_email[:320]),
+            )
+            await conn.commit()
+
+    async def disconnect_google_calendar(self, user_id: int) -> bool:
+        async with self._connect() as conn:
+            cur = await conn.execute("DELETE FROM google_connections WHERE user_id=?", (user_id,))
+            await conn.execute("DELETE FROM google_sync_queue WHERE user_id=?", (user_id,))
+            await conn.execute("DELETE FROM google_meeting_links WHERE user_id=?", (user_id,))
+            await conn.commit()
+        return cur.rowcount > 0
+
+    async def select_google_calendar(
+        self, user_id: int, calendar_id: str, calendar_name: str,
+    ) -> bool:
+        async with self._connect() as conn:
+            connection = await (await conn.execute(
+                "SELECT calendar_id FROM google_connections WHERE user_id=? AND enabled=1",
+                (user_id,),
+            )).fetchone()
+            if not connection:
+                return False
+            old_calendar = str(connection[0])
+            if old_calendar != calendar_id:
+                links = await (await conn.execute(
+                    "SELECT meeting_id,calendar_id,google_event_id FROM google_meeting_links WHERE user_id=?",
+                    (user_id,),
+                )).fetchall()
+                for meeting_id, old_id, event_id in links:
+                    await conn.execute(
+                        """INSERT INTO google_sync_queue
+                           (user_id,meeting_id,action,calendar_id,google_event_id)
+                           VALUES(?,?,'delete',?,?)
+                           ON CONFLICT(user_id,meeting_id,action,calendar_id) DO UPDATE SET
+                             google_event_id=excluded.google_event_id,attempts=0,
+                             available_at=CURRENT_TIMESTAMP,last_error=''""",
+                        (user_id, int(meeting_id), str(old_id), str(event_id)),
+                    )
+                await conn.execute("DELETE FROM google_meeting_links WHERE user_id=?", (user_id,))
+            await conn.execute(
+                """UPDATE google_connections SET calendar_id=?,calendar_name=?,
+                   updated_at=CURRENT_TIMESTAMP WHERE user_id=?""",
+                (calendar_id, calendar_name[:200], user_id),
+            )
+            await conn.commit()
+        await self.queue_google_resync(user_id)
+        return True
+
+    async def queue_google_resync(self, user_id: int) -> int:
+        async with self._connect() as conn:
+            rows = await (await conn.execute(
+                """SELECT id FROM meetings
+                   WHERE user_id=?
+                     AND source_text NOT LIKE 'واردشده از Google Calendar%'""",
+                (user_id,),
+            )).fetchall()
+            for row in rows:
+                await self._queue_google_upsert(conn, user_id, int(row[0]))
+            await conn.commit()
+        return len(rows)
+
+    async def queue_unlinked_google_meetings(self, user_id: int) -> int:
+        """Queue only bot-originated meetings that were not matched during import."""
+        async with self._connect() as conn:
+            rows = await (await conn.execute(
+                """SELECT m.id FROM meetings m
+                   LEFT JOIN google_meeting_links l ON l.meeting_id=m.id
+                   WHERE m.user_id=?
+                     AND m.source_text NOT LIKE 'واردشده از Google Calendar%'
+                     AND l.meeting_id IS NULL""",
+                (user_id,),
+            )).fetchall()
+            for row in rows:
+                await self._queue_google_upsert(conn, user_id, int(row[0]))
+            await conn.commit()
+        return len(rows)
+
+    async def pending_google_syncs(self, limit: int = 50) -> list[dict]:
+        async with self._connect() as conn:
+            rows = await (await conn.execute(
+                """SELECT q.id,q.user_id,q.meeting_id,q.action,q.calendar_id,
+                          q.google_event_id,q.attempts
+                   FROM google_sync_queue q
+                   JOIN google_connections c ON c.user_id=q.user_id AND c.enabled=1
+                   WHERE q.available_at<=CURRENT_TIMESTAMP
+                   ORDER BY q.id LIMIT ?""",
+                (limit,),
+            )).fetchall()
+        return [
+            {"id": int(r[0]), "user_id": int(r[1]), "meeting_id": int(r[2]),
+             "action": r[3], "calendar_id": r[4], "google_event_id": r[5],
+             "attempts": int(r[6])}
+            for r in rows
+        ]
+
+    async def google_meeting_link(self, meeting_id: int, user_id: int) -> dict | None:
+        async with self._connect() as conn:
+            row = await (await conn.execute(
+                """SELECT calendar_id,google_event_id FROM google_meeting_links
+                   WHERE meeting_id=? AND user_id=?""",
+                (meeting_id, user_id),
+            )).fetchone()
+        return {"calendar_id": row[0], "google_event_id": row[1]} if row else None
+
+    async def import_google_event(
+        self, user_id: int, calendar_id: str, google_event_id: str,
+        title: str, starts_at: datetime, ends_at: datetime, source_text: str,
+    ) -> tuple[int, bool]:
+        """Create or refresh a local meeting for a Google event without echoing it back."""
+        async with self._connect() as conn:
+            row = await (await conn.execute(
+                """SELECT l.meeting_id,m.source_text FROM google_meeting_links l
+                   JOIN meetings m ON m.id=l.meeting_id
+                   WHERE l.user_id=? AND l.calendar_id=? AND l.google_event_id=?""",
+                (user_id, calendar_id, google_event_id),
+            )).fetchone()
+            if row:
+                meeting_id = int(row[0])
+                # Older imports may have created a second local row for an event
+                # that already existed in the bot. Prefer the original bot row,
+                # move the Google link to it, and remove only the imported copy.
+                if str(row[1]).startswith("واردشده از Google Calendar"):
+                    original = await (await conn.execute(
+                        """SELECT m.id FROM meetings m
+                           LEFT JOIN google_meeting_links l ON l.meeting_id=m.id
+                           WHERE m.user_id=? AND m.id<>? AND m.title=?
+                             AND m.starts_at=? AND m.ends_at=?
+                             AND m.source_text NOT LIKE 'واردشده از Google Calendar%'
+                             AND l.meeting_id IS NULL
+                           ORDER BY m.id LIMIT 1""",
+                        (user_id, meeting_id, title, starts_at.isoformat(), ends_at.isoformat()),
+                    )).fetchone()
+                    if original:
+                        original_id = int(original[0])
+                        await conn.execute(
+                            "DELETE FROM google_meeting_links WHERE meeting_id=?", (meeting_id,)
+                        )
+                        await conn.execute(
+                            """INSERT INTO google_meeting_links
+                               (meeting_id,user_id,calendar_id,google_event_id,synced_at)
+                               VALUES(?,?,?,?,CURRENT_TIMESTAMP)""",
+                            (original_id, user_id, calendar_id, google_event_id),
+                        )
+                        await conn.execute(
+                            "DELETE FROM google_sync_queue WHERE user_id=? AND meeting_id=?",
+                            (user_id, original_id),
+                        )
+                        await conn.execute("DELETE FROM meetings WHERE id=?", (meeting_id,))
+                        await conn.commit()
+                        return original_id, False
+                await conn.execute(
+                    """UPDATE meetings SET title=?,starts_at=?,ends_at=?,source_text=?
+                       WHERE id=? AND user_id=?""",
+                    (title, starts_at.isoformat(), ends_at.isoformat(), source_text,
+                     meeting_id, user_id),
+                )
+                await conn.execute(
+                    "DELETE FROM google_sync_queue WHERE user_id=? AND meeting_id=? AND action='upsert'",
+                    (user_id, meeting_id),
+                )
+                await conn.commit()
+                return meeting_id, False
+
+            # If the event is already represented by an unlinked local meeting,
+            # attach the Google id instead of creating or uploading a duplicate.
+            existing = await (await conn.execute(
+                """SELECT m.id FROM meetings m
+                   LEFT JOIN google_meeting_links l ON l.meeting_id=m.id
+                   WHERE m.user_id=? AND m.title=? AND m.starts_at=? AND m.ends_at=?
+                     AND l.meeting_id IS NULL
+                   ORDER BY CASE WHEN m.source_text LIKE 'واردشده از Google Calendar%'
+                                 THEN 1 ELSE 0 END, m.id
+                   LIMIT 1""",
+                (user_id, title, starts_at.isoformat(), ends_at.isoformat()),
+            )).fetchone()
+            if existing:
+                meeting_id = int(existing[0])
+                await conn.execute(
+                    """INSERT INTO google_meeting_links
+                       (meeting_id,user_id,calendar_id,google_event_id,synced_at)
+                       VALUES(?,?,?,?,CURRENT_TIMESTAMP)""",
+                    (meeting_id, user_id, calendar_id, google_event_id),
+                )
+                await conn.execute(
+                    "DELETE FROM google_sync_queue WHERE user_id=? AND meeting_id=?",
+                    (user_id, meeting_id),
+                )
+                await conn.commit()
+                return meeting_id, False
+
+            cursor = await conn.execute(
+                """INSERT INTO meetings(user_id,title,starts_at,ends_at,source_text)
+                   VALUES(?,?,?,?,?)""",
+                (user_id, title, starts_at.isoformat(), ends_at.isoformat(), source_text),
+            )
+            meeting_id = int(cursor.lastrowid)
+            await conn.execute(
+                """INSERT INTO google_meeting_links
+                   (meeting_id,user_id,calendar_id,google_event_id,synced_at)
+                   VALUES(?,?,?,?,CURRENT_TIMESTAMP)""",
+                (meeting_id, user_id, calendar_id, google_event_id),
+            )
+            await conn.commit()
+            return meeting_id, True
+
+    async def complete_google_sync(
+        self, queue_id: int, meeting_id: int, user_id: int,
+        calendar_id: str, google_event_id: str, action: str,
+    ) -> None:
+        async with self._connect() as conn:
+            if action == "upsert":
+                await conn.execute(
+                    """INSERT INTO google_meeting_links
+                       (meeting_id,user_id,calendar_id,google_event_id,synced_at)
+                       VALUES(?,?,?,?,CURRENT_TIMESTAMP)
+                       ON CONFLICT(meeting_id) DO UPDATE SET
+                         user_id=excluded.user_id,calendar_id=excluded.calendar_id,
+                         google_event_id=excluded.google_event_id,synced_at=CURRENT_TIMESTAMP""",
+                    (meeting_id, user_id, calendar_id, google_event_id),
+                )
+            else:
+                await conn.execute(
+                    "DELETE FROM google_meeting_links WHERE meeting_id=? AND user_id=? AND calendar_id=?",
+                    (meeting_id, user_id, calendar_id),
+                )
+            await conn.execute("DELETE FROM google_sync_queue WHERE id=?", (queue_id,))
+            await conn.commit()
+
+    async def retry_google_sync(self, queue_id: int, error: str, attempts: int) -> None:
+        delay = min(3600, 30 * (2 ** min(attempts, 7)))
+        async with self._connect() as conn:
+            await conn.execute(
+                """UPDATE google_sync_queue SET attempts=attempts+1,last_error=?,
+                   available_at=datetime('now', ?) WHERE id=?""",
+                (error[:1000], f"+{delay} seconds", queue_id),
+            )
+            await conn.commit()
+
     async def stats(self, user_id: int) -> dict[str, int]:
         async with self._connect() as db:
             row = await (await db.execute("""
@@ -1761,4 +2582,3 @@ class Database:
             (progressed if item["gain"] else stagnant).append(item)
         return {"created": metrics[0] or 0, "completed": metrics[1] or 0, "overdue": metrics[2] or 0,
                 "reports": reports[0] or 0, "progressed": progressed, "stagnant": stagnant}
-

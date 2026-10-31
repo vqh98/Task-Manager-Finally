@@ -7,7 +7,7 @@ from zoneinfo import ZoneInfo
 import jdatetime
 
 from app.db import Database
-from app.recurrence import RecurrenceRule, next_occurrence, occurrences_until, parse_recurrence_text
+from app.recurrence import RecurrenceRule, next_occurrence, occurrences_until, parse_recurrence_text, parse_temporary_weekday_override
 
 
 TZ=ZoneInfo("Asia/Tehran")
@@ -18,6 +18,24 @@ class RecurrenceTests(unittest.IsolatedAsyncioTestCase):
         self.tmp=tempfile.TemporaryDirectory(); self.db=Database(Path(self.tmp.name)/"test.db"); await self.db.init()
 
     async def asyncTearDown(self): self.tmp.cleanup()
+
+    def test_temporary_weekday_override_becomes_three_series(self):
+        now = datetime(2026, 10, 18, 12, tzinfo=TZ)
+        text = ("جلسات DBA دوشنبه و چهارشنبه ساعت 17 تا 18 است؛ "
+                "تایم دوشنبه از این هفته میشه 15 تا 17 تا شش هفته آینده")
+        parts = parse_temporary_weekday_override(text, now)
+        self.assertIsNotNone(parts)
+        self.assertEqual(len(parts), 3)
+        unchanged, temporary, resumed = parts
+        self.assertEqual(unchanged["recurrence"]["weekdays"], [2])
+        self.assertEqual(datetime.fromisoformat(unchanged["starts_at"]).hour, 17)
+        self.assertEqual(temporary["recurrence"]["weekdays"], [0])
+        self.assertEqual(temporary["occurrences"], 6)
+        self.assertEqual((datetime.fromisoformat(temporary["starts_at"]).hour,
+                          datetime.fromisoformat(temporary["ends_at"]).hour), (15, 17))
+        self.assertEqual(datetime.fromisoformat(resumed["starts_at"]).hour, 17)
+        self.assertEqual(datetime.fromisoformat(resumed["starts_at"]).date(),
+                         (datetime.fromisoformat(temporary["starts_at"]) + timedelta(weeks=6)).date())
 
     def test_daily_schedule_does_not_drift(self):
         anchor=datetime(2026,8,10,12,tzinfo=TZ)

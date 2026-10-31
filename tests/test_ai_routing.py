@@ -136,5 +136,24 @@ class AIModelRoutingTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNotNone(deadline)
         self.assertEqual(deadline.utcoffset().total_seconds(), 12600)
 
+    async def test_meeting_summary_receives_the_complete_source_message(self):
+        from app.ai import AIService
+        settings = Settings(
+            bot_token="test", allowed_user_ids=frozenset({1}), timezone=ZoneInfo("Asia/Tehran"),
+            digest_hour=22, digest_minute=0, morning_hour=9, morning_minute=0,
+            deadline_warning_days=2, report_warning_hours=48, database_path=None,
+            openai_api_key="test", openai_base_url="https://example.test",
+            openai_model="test", openai_whisper_model="test",
+        )
+        service = AIService(settings)
+        source = "سلام و عرض ادب\n\nفردا از ساعت ۸ تا ۱۱ در محل موکب برای خدمت‌رسانی حاضر می‌شویم."
+        service._chat_json = AsyncMock(return_value={"title": "خدمت‌رسانی در موکب"})
+
+        title = await service.summarize_meeting(source)
+
+        self.assertEqual(title, "خدمت‌رسانی در موکب")
+        _, user_prompt = service._chat_json.await_args.args
+        self.assertIn(source, user_prompt)
+
 if __name__ == "__main__":
     unittest.main()

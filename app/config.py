@@ -24,6 +24,21 @@ class Settings:
     openai_base_url: str
     openai_model: str
     openai_whisper_model: str
+    google_client_id: str = ""
+    google_client_secret: str = ""
+    google_redirect_uri: str = ""
+    google_oauth_host: str = "127.0.0.1"
+    google_oauth_port: int = 8080
+    google_token_encryption_key: str = ""
+    google_oauth_client_file: str = ""
+    google_public_base_url: str = ""
+    google_support_email: str = ""
+    bot_api_base_url: str = ""
+    enable_google_calendar: bool = True
+    platform_label: str = "تلگرام"
+    platform_key: str = "telegram"
+    mini_app_url: str = ""
+    bale_bot_token: str = ""
 
 
 def load_settings() -> Settings:
@@ -50,6 +65,9 @@ def load_settings() -> Settings:
             raise RuntimeError(f"{name} باید بین {minimum} و {maximum} باشد.")
         return value
 
+    enable_google = os.getenv("ENABLE_GOOGLE_CALENDAR", "1").strip().lower() not in {
+        "0", "false", "no", "off",
+    }
     return Settings(
         bot_token=token,
         allowed_user_ids=ids,
@@ -65,4 +83,19 @@ def load_settings() -> Settings:
         openai_base_url=os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1").strip(),
         openai_model=os.getenv("OPENAI_MODEL", "gpt-4o-mini").strip(),
         openai_whisper_model=os.getenv("OPENAI_WHISPER_MODEL", "whisper-1").strip(),
+        google_client_id=os.getenv("GOOGLE_CLIENT_ID", "").strip(),
+        google_client_secret=os.getenv("GOOGLE_CLIENT_SECRET", "").strip(),
+        google_redirect_uri=os.getenv("GOOGLE_REDIRECT_URI", "").strip(),
+        google_oauth_host=os.getenv("GOOGLE_OAUTH_HOST", "127.0.0.1").strip(),
+        google_oauth_port=bounded_int("GOOGLE_OAUTH_PORT", "8080", 1, 65535),
+        google_token_encryption_key=os.getenv("GOOGLE_TOKEN_ENCRYPTION_KEY", "").strip(),
+        google_oauth_client_file=os.getenv("GOOGLE_OAUTH_CLIENT_FILE", "").strip(),
+        google_public_base_url=os.getenv("GOOGLE_PUBLIC_BASE_URL", "").strip().rstrip("/"),
+        google_support_email=os.getenv("GOOGLE_SUPPORT_EMAIL", "").strip(),
+        bot_api_base_url=os.getenv("BOT_API_BASE_URL", "").strip().rstrip("/"),
+        enable_google_calendar=enable_google,
+        platform_label=os.getenv("PLATFORM_LABEL", "تلگرام").strip() or "تلگرام",
+        platform_key=os.getenv("PLATFORM_KEY", "telegram").strip().lower() or "telegram",
+        mini_app_url=os.getenv("MINI_APP_URL", "").strip(),
+        bale_bot_token=os.getenv("BALE_BOT_TOKEN", "").strip(),
     )
