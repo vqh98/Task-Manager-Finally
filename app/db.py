@@ -40,6 +40,9 @@ _TASK_ACTOR_JOINS = """
     LEFT JOIN users u ON u.user_id=t.last_changed_by
 """
 
+_UNASSIGNED_TASK_SQL = """(t.assignee_user_id IS NULL AND
+    TRIM(COALESCE(t.assignee,'')) IN ('','بدون مسئول','-','—'))"""
+
 
 class Database:
     def __init__(self, path: Path):
@@ -1720,7 +1723,9 @@ class Database:
                           include_done: bool = True) -> list[Task]:
         query = f"SELECT {_TASK_COLUMNS} FROM tasks t {_TASK_ACTOR_JOINS} WHERE t.user_id=?"
         params: list[object] = [user_id]
-        if not include_unassigned:
+        if filters.get("unassigned") is True:
+            query += f" AND {_UNASSIGNED_TASK_SQL}"
+        elif not include_unassigned:
             query += " AND NOT (t.assignee='' AND t.assignee_user_id IS NULL)"
         if not include_done:
             query += " AND t.status!='done'"
@@ -1743,6 +1748,12 @@ class Database:
         if filters.get("assignee_contains"):
             query += " AND assignee LIKE ?"
             params.append(f"%{filters['assignee_contains']}%")
+        if "assignee_user_id" in filters:
+            query += " AND t.assignee_user_id=?"
+            params.append(int(filters["assignee_user_id"]))
+        if "assignee_exact" in filters:
+            query += " AND t.assignee_user_id IS NULL AND TRIM(t.assignee)=?"
+            params.append(str(filters["assignee_exact"]).strip())
         if filters.get("title_contains"):
             query += " AND title LIKE ?"
             params.append(f"%{filters['title_contains']}%")
@@ -1771,6 +1782,19 @@ class Database:
         async with self._connect() as db:
             rows = await (await db.execute(query, params)).fetchall()
         return [self._task_from_row(row) for row in rows]
+
+    async def task_assignee_groups(self, user_id: int) -> list[tuple[int | None, str, int]]:
+        """Group open tasks by linked identity or exact manually-entered name."""
+        async with self._connect() as db:
+            rows = await (await db.execute(
+                f"""SELECT t.assignee_user_id, MAX(TRIM(t.assignee)), COUNT(*)
+                    FROM tasks t WHERE t.user_id=? AND t.status!='done'
+                    AND NOT {_UNASSIGNED_TASK_SQL}
+                    GROUP BY t.assignee_user_id,
+                        CASE WHEN t.assignee_user_id IS NULL THEN TRIM(t.assignee) ELSE '' END
+                    ORDER BY MAX(TRIM(t.assignee)) COLLATE NOCASE, t.assignee_user_id""", (user_id,),
+            )).fetchall()
+        return [(row[0], row[1] or str(row[0]), row[2]) for row in rows]
 
     async def delete_task(self, task_id: int, user_id: int) -> bool:
         async with self._connect() as db:

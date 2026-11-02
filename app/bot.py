@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import html
+import hashlib
 import logging
 import math
 import re
@@ -1526,6 +1527,7 @@ async def list_tasks(message: Message) -> None:
 
 TASK_PAGE_FILTERS = {
     "all": ({}, "📋 همه تسک‌ها"),
+    "unassigned": ({"unassigned": True}, "👤 تسک‌های بدون مسئول"),
     "p1": ({"priority": 1}, "🎯 تسک‌های 🔴 فوری و مهم"),
     "p2": ({"priority": 2}, "🎯 تسک‌های 🟠 مهم، غیرفوری"),
     "p3": ({"priority": 3}, "🎯 تسک‌های 🟡 فوری، کم‌اهمیت"),
@@ -1542,6 +1544,80 @@ TASK_PAGE_FILTERS = {
 }
 
 
+def task_assignee_key(member_id: int | None, name: str) -> str:
+    if member_id is not None:
+        return f"au{member_id}"
+    return "an" + hashlib.sha256(name.encode("utf-8")).hexdigest()[:20]
+
+
+async def task_page_config(user_id: int, page_key: str):
+    config = TASK_PAGE_FILTERS.get(page_key)
+    if config:
+        return config
+    if not page_key.startswith(("au", "an")):
+        return None
+    for member_id, name, _ in await db.task_assignee_groups(user_id):
+        if task_assignee_key(member_id, name) == page_key:
+            filters = {"assignee_user_id": member_id} if member_id is not None else {"assignee_exact": name}
+            suffix = " (نام دستی)" if member_id is None else ""
+            return filters, f"👤 تسک‌های {name}{suffix}"
+    return None
+
+
+async def render_task_assignees(callback: CallbackQuery, page: int = 0) -> None:
+    groups = await db.task_assignee_groups(callback.from_user.id)
+    page = max(0, min(page, max(0, (len(groups) - 1) // 10)))
+    builder = InlineKeyboardBuilder()
+    builder.button(text="👤 بدون مسئول", callback_data="taskassignee:unassigned")
+    for member_id, name, count in groups[page * 10:(page + 1) * 10]:
+        suffix = " (نام دستی)" if member_id is None else ""
+        builder.button(text=f"{name[:40]}{suffix} — {fa_number(count)} تسک",
+                       callback_data=f"taskassignee:{task_assignee_key(member_id, name)}")
+    if page:
+        builder.button(text="⬅️ قبلی", callback_data=f"taskassignees:{page - 1}")
+    if (page + 1) * 10 < len(groups):
+        builder.button(text="بعدی ➡️", callback_data=f"taskassignees:{page + 1}")
+    builder.button(text="⬅️ بازگشت به فیلترها", callback_data="tasklist:menu")
+    builder.adjust(1)
+    await callback.message.edit_text(
+        "مسئول موردنظر را انتخاب کنید؛ فهرست بر اساس تسک‌های تکمیل‌نشده است.",
+        reply_markup=builder.as_markup(),
+    )
+
+
+@router.callback_query(F.data == "tasklist:assignee")
+async def task_list_assignee_menu(callback: CallbackQuery) -> None:
+    if await reject_if_needed(callback):
+        return
+    await callback.answer()
+    await render_task_assignees(callback)
+
+
+@router.callback_query(F.data.startswith("taskassignees:"))
+async def task_assignee_menu_page(callback: CallbackQuery) -> None:
+    if await reject_if_needed(callback):
+        return
+    page = callback.data.split(":", 1)[1]
+    if not page.isdigit():
+        await callback.answer("صفحه نامعتبر است.", show_alert=True)
+        return
+    await callback.answer()
+    await render_task_assignees(callback, int(page))
+
+
+@router.callback_query(F.data.startswith("taskassignee:"))
+async def task_list_by_assignee(callback: CallbackQuery) -> None:
+    if await reject_if_needed(callback):
+        return
+    page_key = callback.data.split(":", 1)[1]
+    config = await task_page_config(callback.from_user.id, page_key)
+    if not config or not (page_key == "unassigned" or page_key.startswith(("au", "an"))):
+        await callback.answer("این مسئول در فهرست فعلی شما نیست؛ فیلترها را دوباره باز کنید.", show_alert=True)
+        return
+    await callback.answer()
+    await render_task_list(callback.message, callback.from_user.id, *config, page_key=page_key)
+
+
 async def render_task_list(
     message: Message, user_id: int, filters: dict | None = None, title: str = "",
     *, page_key: str = "all", page: int = 0,
@@ -1549,7 +1625,7 @@ async def render_task_list(
     filters = filters or {}
     tasks = await db.query_tasks(
         user_id, filters, sort="priority_asc", limit=50,
-        now=datetime.now(settings.timezone), include_unassigned=False,
+        now=datetime.now(settings.timezone), include_unassigned=bool(filters.get("unassigned")),
         include_done=filters.get("status") == "done",
     )
     if not tasks:
@@ -1596,7 +1672,7 @@ async def task_list_page(callback: CallbackQuery) -> None:
     if await reject_if_needed(callback):
         return
     _, page_key, page_raw = callback.data.split(":", 2)
-    config = TASK_PAGE_FILTERS.get(page_key)
+    config = await task_page_config(callback.from_user.id, page_key)
     if not config:
         await callback.answer("فهرست تسک‌ها منقضی شده است.", show_alert=True)
         return
@@ -1613,14 +1689,14 @@ async def send_all_visible_tasks(callback: CallbackQuery) -> None:
     if await reject_if_needed(callback):
         return
     page_key = callback.data.split(":", 1)[1]
-    config = TASK_PAGE_FILTERS.get(page_key)
+    config = await task_page_config(callback.from_user.id, page_key)
     if not config:
         await callback.answer("فهرست تسک‌ها منقضی شده است.", show_alert=True)
         return
     filters, title = config
     tasks = await db.query_tasks(
         callback.from_user.id, filters, sort="priority_asc", limit=50,
-        now=datetime.now(settings.timezone), include_unassigned=False,
+        now=datetime.now(settings.timezone), include_unassigned=bool(filters.get("unassigned")),
         include_done=filters.get("status") == "done",
     )
     if not tasks:

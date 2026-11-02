@@ -228,6 +228,8 @@ def task_list_filters() -> InlineKeyboardMarkup:
         [InlineKeyboardButton(text="🎯 فیلتر ماتریس آیزنهاور", callback_data="tasklist:priority")],
         [InlineKeyboardButton(text="⏰ فیلتر بر اساس ددلاین", callback_data="tasklist:deadline")],
         [InlineKeyboardButton(text="📈 فیلتر بر اساس میزان پیشرفت", callback_data="tasklist:progress")],
+        [InlineKeyboardButton(text="👤 فیلتر بر اساس مسئول", callback_data="tasklist:assignee")],
+        [InlineKeyboardButton(text="👤 تسک‌های بدون مسئول", callback_data="taskassignee:unassigned")],
         [InlineKeyboardButton(text="↩️ منوی اصلی", callback_data="menu:main")],
     ])
 
