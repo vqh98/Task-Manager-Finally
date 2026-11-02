@@ -33,7 +33,7 @@ class TaskAssigneeFilterTests(unittest.IsolatedAsyncioTestCase):
 
     def patches(self):
         return patch.multiple(bot_module, db=self.db, settings=SimpleNamespace(timezone=self.zone),
-                              reject_if_needed=AsyncMock(return_value=False))
+                              reject_if_needed=AsyncMock(return_value=False), create=True)
 
     async def test_unassigned_includes_legacy_markers_but_not_linked_users_or_other_owners(self):
         expected = {await self.add(name) for name in ("", "بدون مسئول", "  ", "-", "—")}
